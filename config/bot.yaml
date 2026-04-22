@@ -1,0 +1,61 @@
+# blksch bot configuration
+# All values are SEEDS — tune on paper-trading data before live promotion.
+# Paper sections referenced in comments; see ARCHITECTURE.md for module mapping.
+
+mode: paper              # paper | live
+env: mainnet             # mainnet | amoy (testnet)
+
+# --- Avellaneda-Stoikov in logit units (paper §4.2 eq 8-9) ---
+quoting:
+  gamma: 0.1             # risk aversion; tune on inventory half-life
+  k: 1.5                 # order-arrival decay; fit from fill distance vs intensity
+  T_horizon_mode: time_to_resolution   # fall back to 1h for long-dated
+  T_fallback_sec: 3600
+
+# --- Boundary handling (paper §4.2, §5.1) ---
+boundary:
+  eps: 1.0e-5            # clip p to [eps, 1-eps]
+  delta_p_floor_ticks: 1 # half-spread floor in p-space (ticks)
+
+# --- Inventory caps (paper §4.2) ---
+inventory:
+  q_max_notional_usd: 50       # cap scales with 1/max(S'(x), eps)
+  q_max_shrink_factor: 1.0     # multiplier on cap; <1 tightens
+
+# --- Refresh loop (paper §4.5) ---
+loop:
+  refresh_ms: 250              # range 100-500 ms
+
+# --- Calibration (paper §5, §6.4) ---
+calibration:
+  kf_grid_hz: 1                # paper uses 1 Hz
+  em_window_sec: 400           # rolling EM window
+  em_global_steps: 6           # initial global EM passes
+  jump_threshold_tau_J: 0.7    # posterior threshold (paper §5.2)
+  mc_draws_per_step: 600       # Monte Carlo draws for jump compensator
+  sprime_clip: 1.0e-4          # numerical floor for S'(x) in drift formula
+  mu_cap_per_sec: 0.25         # cap on |μ| per second
+
+# --- Surface smoothing (paper §5.3) ---
+surface:
+  spline_alpha: 1.0            # smoothness penalty
+  shape_nonneg: true
+  shape_edge_stable: true
+
+# --- Execution hygiene (paper §4.2) ---
+guards:
+  toxicity_vpin_bucket: 50     # trades per VPIN bucket
+  news_guard_widen_factor: 2.0 # multiplier on gamma or (T-t) pre-announcement
+  queue_discipline_replace_ms: 150  # cancel+replace on adverse microstructure
+
+# --- Kill-switches (paper §4.6) ---
+limits:
+  feed_gap_sec: 3                   # auto-pause if no tick for N seconds
+  volatility_spike_z: 5.0           # auto-pause if sigma_b jumps > Z stddevs
+  repeated_pickoff_window_sec: 60   # lookback
+  repeated_pickoff_count: 3         # N adverse fills in window -> pause
+  max_drawdown_usd: 100.0           # hard cap
+
+# --- PnL attribution (paper §4.6) ---
+pnl:
+  reconcile_tolerance_usd: 0.50     # warn if attribution sums drift > this
