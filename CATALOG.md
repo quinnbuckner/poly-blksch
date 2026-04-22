@@ -45,7 +45,7 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 
 | Module | Status | Paper ref | Notes |
 |---|---|---|---|
-| `ingest/polyclient.py` | ⬜ | — | REST + WS for Polymarket CLOB |
+| `ingest/polyclient.py` | ✅ | — | Async REST + CLOB WS; rate-limited; emits BookSnap/TradeTick |
 | `ingest/store.py` | ⬜ | — | Parquet tick store |
 | `ingest/screener.py` | ⬜ | — | Top-liquidity picker |
 | `filter/canonical_mid.py` | ⬜ | §5.1 | Trade-weighted mid + outlier hygiene |
@@ -87,7 +87,7 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 
 | Path | Status | Notes |
 |---|---|---|
-| `tests/unit/` | 🟡 | Track B complete (greeks/quote/guards/pnl/limits); A & C pending |
+| `tests/unit/` | 🟡 | Track B complete (greeks/quote/guards/pnl/limits); Track A polyclient ✅; rest pending |
 | `tests/integration/test_track_b_quote.py` | ✅ | Fixed-input Quote + toxicity widen + feed-gap pull + news widen + inventory cap |
 | `tests/pipeline/` | ⬜ | End-to-end including Sec 6 replication |
 | `tests/fixtures/` | ⬜ | Recorded book snapshots, synthetic paths |
@@ -96,3 +96,4 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 
 - **Day 0 (Apr 22 2026)** — Repo scaffolded. Pydantic schemas written. Config seeded. All three track folders created with READMEs. Nothing wired yet. Committed and pushed to `origin main`.
 - **Apr 22 2026 — Track B Stage 1 complete.** Shipped `mm/greeks.py`, `mm/quote.py`, `mm/guards.py`, `mm/pnl.py`, `mm/limits.py`, `mm/refresh_loop.py` (paper §4.1, §4.2 eq 8-9, §4.5, §4.6). 110 unit+integration tests green. Critical integration test `tests/integration/test_track_b_quote.py` verifies expected Quote on fixed inputs, toxicity/news spread widening, feed-gap + inventory-cap pulls. Stage 2/3 (`mm/hedge/*`) still stubbed.
+- **Apr 22 2026 — Track A `polyclient.py`.** `core/ingest/polyclient.py` landed: async aiohttp + websockets client for Polymarket Gamma/CLOB REST and the CLOB `market` WS channel. Emits `BookSnap` and `TradeTick`. In-memory book state + diff application for `price_change` events. Reconnect with exponential backoff. Rate-limiter ported from `polyarb_v1.0/src/api.py`. 20 unit tests on parsers + limiter.
