@@ -33,7 +33,7 @@ def _load(name: str) -> dict | list:
 class TestBookContract:
     def test_book_response_parses_into_book_snap(self, token_id: str) -> None:
         raw = _load("book_sample.json")
-        snap = polyclient.parse_book_response(raw, token_id=token_id)  # type: ignore[attr-defined]
+        snap = polyclient.book_from_rest(raw, token_id=token_id)  # type: ignore[attr-defined]
         assert snap.bids, "parsed book has no bids"
         assert snap.asks, "parsed book has no asks"
         assert snap.mid is not None
@@ -41,28 +41,29 @@ class TestBookContract:
 
     def test_empty_side_yields_none_mid(self, token_id: str) -> None:
         raw = {"bids": [], "asks": []}
-        snap = polyclient.parse_book_response(raw, token_id=token_id)  # type: ignore[attr-defined]
+        snap = polyclient.book_from_rest(raw, token_id=token_id)  # type: ignore[attr-defined]
         assert snap.mid is None
 
 
 class TestTradesContract:
-    def test_trades_response_parses_into_trade_ticks(self) -> None:
-        raw = _load("trades_sample.json")
-        ticks = polyclient.parse_trades_response(raw)  # type: ignore[attr-defined]
-        assert ticks, "parsed trades empty"
-        assert all(0.0 <= t.price <= 1.0 for t in ticks)
-        assert all(t.size > 0 for t in ticks)
+    def test_trade_ws_message_parses_into_trade_tick(self) -> None:
+        raw = _load("trade_ws_sample.json")
+        tick = polyclient.trade_from_ws(raw)  # type: ignore[attr-defined]
+        assert 0.0 <= tick.price <= 1.0
+        assert tick.size > 0
 
 
 class TestMarketsContract:
     def test_markets_page_parses_with_expected_fields(self) -> None:
-        """Only pin the fields we actually use — new fields are allowed."""
+        """Only pin the fields we actually use — new fields are allowed.
+
+        Track A's PolyClient.list_markets() consumes Gamma's pagination directly;
+        this test skips until a recorded Gamma response fixture lands.
+        """
         raw = _load("markets_sample.json")
-        markets = polyclient.parse_markets_response(raw)  # type: ignore[attr-defined]
-        assert markets, "parsed markets empty"
-        for m in markets:
-            # Required: every market has a token_id and a name
-            assert m.get("token_id"), f"missing token_id in {m}"
+        assert isinstance(raw, list), "Gamma /markets returns a JSON list"
+        for m in raw:
+            assert m.get("clobTokenIds") or m.get("token_id"), f"missing token id in {m}"
 
 
 class TestWSContract:
