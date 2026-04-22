@@ -4,7 +4,7 @@
 
 **Responsibility:** turn Track A's calibrated surface + Track C's inventory into `Quote` messages. Run the refresh loop. Decide hedges. Manage kill-switches and PnL attribution.
 
-**Status:** ⬜ pending. Day-0 scaffold only.
+**Status:** Stage 1 ✅ (vanilla MM path wired end-to-end). Stages 2-3 (hedges) pending gates.
 
 ## Inputs and outputs
 
@@ -19,28 +19,47 @@
 
 ## Files
 
-| File | Paper § | Stage | Notes |
-|---|---|---|---|
-| `greeks.py` | 4.1 | 1 | `Δ_x = p(1-p)`, `Γ_x = p(1-p)(1-2p)`, `ν_b`, `ν_ρ` |
-| `quote.py` | 4.2 eq 8–9 | 1 | Reservation + spread in logit; boundary floor; inventory cap |
-| `guards.py` | 4.2 | 1 | Toxicity (VPIN), news window, queue discipline |
-| `refresh_loop.py` | 4.5 | 1 | 100–500 ms asyncio cycle wiring A→B→C |
-| `pnl.py` | 4.6 | 1 | Δ–Γ–ν_b–ν_ρ–jump attribution |
-| `limits.py` | 4.6 | 1 | Kill-switches, auto-pause |
-| `hedge/beta.py` | 4.4 | 2 | Cross-event β-hedge |
-| `hedge/calendar.py` | 4.3 | 3 | Variance-strip sizing |
-| `hedge/synth_strip.py` | 3.4 | 3 | Synthetic variance/corridor from vanilla basket |
+| File | Paper § | Stage | Status | Notes |
+|---|---|---|---|---|
+| `greeks.py` | 4.1 | 1 | ✅ | `Δ_x = p(1-p)`, `Γ_x = p(1-p)(1-2p)`, `ν_b` (x-var + p-var), `ν_ρ` |
+| `quote.py` | 4.2 eq 8–9 | 1 | ✅ | `compute_quote()` pure fn; boundary floor; inventory cap |
+| `guards.py` | 4.2 | 1 | ✅ | `ToxicityMonitor`, `NewsGuard`, `QueueMonitor`, `GuardState.decide()` |
+| `refresh_loop.py` | 4.5 | 1 | ✅ | `RefreshLoop` — asyncio cycle, DataFeed/QuoteSink/PullSink protocols |
+| `pnl.py` | 4.6 | 1 | ✅ | `Attributor.step()` → Δ-Γ-ν-jump decomposition |
+| `limits.py` | 4.6 | 1 | ✅ | `LimitsState.evaluate()` → KillSwitchReport |
+| `hedge/beta.py` | 4.4 | 2 | ⬜ | Cross-event β-hedge (gated on Stage 1 live paper validation) |
+| `hedge/calendar.py` | 4.3 | 3 | ⬜ | Variance-strip sizing |
+| `hedge/synth_strip.py` | 3.4 | 3 | ⬜ | Synthetic variance/corridor from vanilla basket |
 
 ## Build order
 
 See the plan's Window-2 prompt. Ship each with unit tests before moving on:
 
-1. `greeks.py` + `quote.py` (pure functions, heavy unit testing)
-2. `guards.py`
-3. `pnl.py` + `limits.py`
-4. `refresh_loop.py` (wires it all)
+1. ✅ `greeks.py` + `quote.py` (pure functions, heavy unit testing)
+2. ✅ `guards.py`
+3. ✅ `pnl.py` + `limits.py`
+4. ✅ `refresh_loop.py` (wires it all)
 5. **Stage 2:** `hedge/beta.py`
 6. **Stage 3:** `hedge/calendar.py`, `hedge/synth_strip.py`
+
+## How Track B plugs into the rest of the bot
+
+```
+Track A                                       Track C
+──────                                        ──────
+LogitState, SurfacePoint,           ┌─────→   Quote      (Track C order router)
+BookSnap, TradeTick            ───┐ │
+                                  ▼ │
+   CorrelationEntry  ──── MarketSnapshot ──── RefreshLoop
+                                     │
+Track C               ───────────────┘
+──────
+Position, Fill                         (stage 2/3: HedgeInstruction)
+```
+
+`MarketSnapshot` is built by Track C's data feed adapter (or a test stub) from
+the Track A + Track C pydantic contracts; nothing in `mm/` imports from `core/`
+or `exec/` directly.
 
 ## Rules of engagement
 

@@ -8,8 +8,8 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 
 | Stage | Scope | Status |
 |---|---|---|
-| 0 | Scaffold + Track A calibration | 🛠 scaffold complete; Track A pending |
-| 1 | Tracks A+B+C on paper engine | ⬜ |
+| 0 | Scaffold + Track A calibration | 🛠 scaffold complete; Track A ingest underway; Track B Stage-1 done |
+| 1 | Tracks A+B+C on paper engine | 🛠 Track B Stage-1 complete (quote/guards/pnl/limits/refresh_loop); awaiting A & C |
 | 2 | Live CLOB orders | ⬜ |
 | 3 | Cross-event β-hedges | ⬜ |
 | 4 | Synthetic variance/corridor strips | ⬜ |
@@ -62,12 +62,12 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 
 | Module | Status | Paper ref | Notes |
 |---|---|---|---|
-| `greeks.py` | ⬜ | §4.1 | Δ_x, Γ_x, ν_b, ν_ρ |
-| `quote.py` | ⬜ | §4.2 eq 8–9 | AS reservation + spread in logit |
-| `guards.py` | ⬜ | §4.2 | Toxicity / news / queue discipline |
-| `refresh_loop.py` | ⬜ | §4.5 | 100–500 ms asyncio cycle |
-| `pnl.py` | ⬜ | §4.6 | Δ–Γ–ν_b–ν_ρ–jump attribution |
-| `limits.py` | ⬜ | §4.6 | Kill-switches, auto-pause |
+| `greeks.py` | ✅ | §4.1 | Δ_x, Γ_x, ν_b (x-var + p-var), ν_ρ |
+| `quote.py` | ✅ | §4.2 eq 8–9 | AS reservation + spread in logit; δ_p floor; inventory cap |
+| `guards.py` | ✅ | §4.2 | VPIN toxicity / news window + pause / queue discipline |
+| `refresh_loop.py` | ✅ | §4.5 | 100–500 ms asyncio cycle; per-token state; pluggable sinks |
+| `pnl.py` | ✅ | §4.6 | Δ–Γ–ν_b–ν_ρ–jump attribution; realized vs expected (dp)² |
+| `limits.py` | ✅ | §4.6 | Feed-gap / vol spike / pickoff / drawdown / swing-zone Γ |
 | `hedge/beta.py` | ⬜ | §4.4 | Cross-event β-hedge (Stage 2) |
 | `hedge/calendar.py` | ⬜ | §4.3 | Variance-strip sizing (Stage 3) |
 | `hedge/synth_strip.py` | ⬜ | §3.4 | Synthetic variance/corridor (Stage 3) |
@@ -87,11 +87,12 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 
 | Path | Status | Notes |
 |---|---|---|
-| `tests/unit/` | ⬜ | Pure math, fast |
-| `tests/integration/` | ⬜ | Per-track with fixtures |
+| `tests/unit/` | 🟡 | Track B complete (greeks/quote/guards/pnl/limits); A & C pending |
+| `tests/integration/test_track_b_quote.py` | ✅ | Fixed-input Quote + toxicity widen + feed-gap pull + news widen + inventory cap |
 | `tests/pipeline/` | ⬜ | End-to-end including Sec 6 replication |
 | `tests/fixtures/` | ⬜ | Recorded book snapshots, synthetic paths |
 
 ## Change log
 
 - **Day 0 (Apr 22 2026)** — Repo scaffolded. Pydantic schemas written. Config seeded. All three track folders created with READMEs. Nothing wired yet. Committed and pushed to `origin main`.
+- **Apr 22 2026 — Track B Stage 1 complete.** Shipped `mm/greeks.py`, `mm/quote.py`, `mm/guards.py`, `mm/pnl.py`, `mm/limits.py`, `mm/refresh_loop.py` (paper §4.1, §4.2 eq 8-9, §4.5, §4.6). 110 unit+integration tests green. Critical integration test `tests/integration/test_track_b_quote.py` verifies expected Quote on fixed inputs, toxicity/news spread widening, feed-gap + inventory-cap pulls. Stage 2/3 (`mm/hedge/*`) still stubbed.
