@@ -1,0 +1,9 @@
+{
+  "errorMsg": "",
+  "orderID": "0xorder1111111111111111111111111111111111111111111111111111111111",
+  "takingAmount": "10000000",
+  "makingAmount": "5000000",
+  "status": "live",
+  "success": true,
+  "transactionsHashes": null
+}

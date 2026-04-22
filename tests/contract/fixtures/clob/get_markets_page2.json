@@ -1,0 +1,22 @@
+{
+  "limit": "500",
+  "count": "1",
+  "next_cursor": "LTE=",
+  "data": [
+    {
+      "condition_id": "0xcond3333333333333333333333333333333333333333333333333333333333",
+      "question_id": "0x3333",
+      "question": "Tail market",
+      "market_slug": "tail-market",
+      "end_date_iso": "2027-01-01T00:00:00Z",
+      "active": true,
+      "closed": false,
+      "minimum_order_size": "5",
+      "minimum_tick_size": "0.01",
+      "tokens": [
+        {"token_id": "55555555555555555555555555555555555555555555555555555555555555555555", "outcome": "Yes", "price": 0.5, "winner": false},
+        {"token_id": "66666666666666666666666666666666666666666666666666666666666666666666", "outcome": "No",  "price": 0.5, "winner": false}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "event_type": "last_trade_price",
+  "asset_id": "52114319501245915516055106046884209969926127482827954674443846427813813222426",
+  "market": "0xabc1234567890def1234567890abcdef1234567890abcdef1234567890abcdef",
+  "price": "0.51",
+  "size": "25.0",
+  "side": "BUY",
+  "fee_rate_bps": "0",
+  "timestamp": "1745000002000"
+}

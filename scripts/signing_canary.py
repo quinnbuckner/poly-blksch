@@ -4,17 +4,22 @@ Places a tiny $1 YES-buy order at a far-from-market price (won't fill), waits
 3 seconds, cancels. If both the signed POST and signed DELETE succeed, our
 EIP-712 signing + auth plumbing works against the live CLOB.
 
-Do NOT promote to Stage 2 (--mode=live) until this passes.
+Do NOT promote to Stage 2 (--mode=live) until this passes. Run
+``live_ro_auth_check.py --i-mean-it`` first — it exercises the same auth
+pipeline without placing an order.
 
-Usage:
-    python scripts/signing_canary.py --token-id <TOKEN> --i-mean-it
+Usage::
+
+    python scripts/signing_canary.py --token-id <TOKEN>                     # dry-run
+    python scripts/signing_canary.py --token-id <TOKEN> --i-mean-it         # mainnet
+    python scripts/signing_canary.py --token-id <TOKEN> --i-mean-it --testnet
 
 Env (via .env or process env):
     POLY_PRIVATE_KEY
-    POLY_API_KEY
-    POLY_API_SECRET
-    POLY_API_PASSPHRASE
     POLY_FUNDER_ADDRESS
+    POLY_API_KEY             (optional — derived on first signed call)
+    POLY_API_SECRET          (optional)
+    POLY_API_PASSPHRASE      (optional)
 """
 
 from __future__ import annotations
@@ -24,78 +29,104 @@ import asyncio
 import logging
 import os
 import sys
-import time
+import uuid
 
 log = logging.getLogger("signing_canary")
 
 
-def _require_env() -> dict[str, str]:
-    missing = []
-    required = (
-        "POLY_PRIVATE_KEY",
-        "POLY_API_KEY",
-        "POLY_API_SECRET",
-        "POLY_API_PASSPHRASE",
-        "POLY_FUNDER_ADDRESS",
-    )
-    env = {}
-    for key in required:
-        v = os.environ.get(key)
-        if not v:
-            missing.append(key)
-        env[key] = v or ""
-    if missing:
-        raise SystemExit(f"Missing required env vars: {missing}. See .env.example.")
-    return env
+REQUIRED_ENV = ("POLY_PRIVATE_KEY", "POLY_FUNDER_ADDRESS")
 
 
-async def _run(token_id: str, far_price: float, size_usd: float) -> int:
-    # Imported lazily so --help works without the package installed.
+def _load_env() -> None:
     try:
-        from blksch.exec.clob_client import make_clob_client  # type: ignore
-    except ImportError as e:
-        log.error("exec.clob_client not importable: %s", e)
-        log.error("This canary requires Track C's clob_client to be landed.")
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv()
+
+
+def _validate_env() -> list[str]:
+    return [k for k in REQUIRED_ENV if not os.environ.get(k)]
+
+
+async def _run(token_id: str, far_price: float, size_usd: float, *, testnet: bool) -> int:
+    try:
+        from blksch.exec.clob_client import CLOBConfig, PyCLOBClient
+        from blksch.schemas import OrderSide, OrderStatus
+    except ImportError as exc:
+        log.error("blksch package not importable: %s", exc)
+        log.error("Install with `pip install -e .` from the repo root.")
         return 2
 
-    env = _require_env()
-    client = make_clob_client(  # type: ignore[call-arg]
-        private_key=env["POLY_PRIVATE_KEY"],
-        api_key=env["POLY_API_KEY"],
-        api_secret=env["POLY_API_SECRET"],
-        api_passphrase=env["POLY_API_PASSPHRASE"],
-        funder=env["POLY_FUNDER_ADDRESS"],
-    )
+    cfg = CLOBConfig.from_env(testnet=testnet)
+    if not cfg.has_signing_creds():
+        log.error("Missing POLY_PRIVATE_KEY / POLY_FUNDER_ADDRESS — cannot sign.")
+        return 2
+
+    client = PyCLOBClient(cfg)
+    client_id = f"canary-{uuid.uuid4().hex[:10]}"
+    size = size_usd / max(far_price, 1e-6)
 
     log.info(
-        "Placing canary BUY: token=%s price=%s size_usd=%s (should NOT fill)",
-        token_id, far_price, size_usd,
+        "Placing canary BUY: token=%s price=%.4f size=%.4f (notional≈$%.2f). Should NOT fill.",
+        token_id, far_price, size, size_usd,
     )
     try:
-        placed = await client.place_order(  # type: ignore[attr-defined]
+        order = await client.place_order(
             token_id=token_id,
-            side="BUY",
+            side=OrderSide.BUY,
             price=far_price,
-            size=size_usd / max(far_price, 1e-6),
+            size=size,
+            client_id=client_id,
+            order_type="GTC",
         )
-    except Exception as e:
-        log.error("CANARY FAILED on POST /order: %s", e)
+    except Exception as exc:
+        log.error("CANARY FAILED on POST /order: %s", exc)
         return 3
 
-    order_id = placed.get("id") or placed.get("order_id")
-    log.info("Placed OK: venue_id=%s. Waiting 3s, then canceling...", order_id)
+    if order.status is OrderStatus.REJECTED:
+        log.error("CANARY FAILED — CLOB rejected order: client_id=%s", client_id)
+        return 3
+
+    venue_id = order.venue_id
+    log.info("Placed OK: client_id=%s venue_id=%s. Waiting 3s, then canceling...",
+             client_id, venue_id)
     await asyncio.sleep(3.0)
 
-    try:
-        canceled = await client.cancel_order(order_id)  # type: ignore[attr-defined]
-    except Exception as e:
-        log.error("CANARY FAILED on DELETE /order: %s", e)
-        log.error("!!! Manually cancel order_id=%s via Polymarket UI !!!", order_id)
+    if not venue_id:
+        log.error("No venue_id on placed order — cannot cancel. Check response shape.")
         return 4
 
-    log.info("Cancel OK: %s", canceled)
-    log.info("CANARY PASSED — signing + auth plumbing works.")
+    try:
+        canceled = await client.cancel_order(venue_id)
+    except Exception as exc:
+        log.error("CANARY FAILED on DELETE /order: %s", exc)
+        log.error("!!! Manually cancel venue_id=%s via the Polymarket UI !!!", venue_id)
+        return 4
+
+    if not canceled:
+        log.error("Cancel not confirmed: venue_id=%s. Check ledger/UI before Stage-2 promotion.",
+                  venue_id)
+        return 4
+
+    log.info("Cancel OK. CANARY PASSED — signing + auth plumbing works on %s.",
+             "Amoy testnet" if testnet else "Polygon mainnet")
     return 0
+
+
+def _print_plan(args: argparse.Namespace) -> None:
+    size = args.size_usd / max(args.far_price, 1e-6)
+    log.warning("Dry-run (no --i-mean-it). Plan:")
+    log.warning("  1. Load .env (if present) + process env")
+    log.warning("  2. Validate %s are set", ", ".join(REQUIRED_ENV))
+    log.warning("  3. Build PyCLOBClient on %s",
+                "Polygon Amoy (testnet)" if args.testnet else "Polygon mainnet")
+    log.warning("  4. Signed POST /order: BUY token=%s price=%.4f size=%.4f (notional≈$%.2f)",
+                args.token_id, args.far_price, size, args.size_usd)
+    log.warning("  5. Sleep 3s")
+    log.warning("  6. Signed DELETE /order (cancel)")
+    log.warning("  7. Exit 0 only if both succeed")
+    log.warning("Re-run with --i-mean-it to execute.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -114,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Notional size in USD (default $1)",
     )
     parser.add_argument(
+        "--testnet",
+        action="store_true",
+        help="Point at Polygon Amoy instead of Polygon mainnet.",
+    )
+    parser.add_argument(
         "--i-mean-it",
         action="store_true",
         help="Required to actually run. Without this flag, the script prints the plan and exits.",
@@ -126,16 +162,18 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    _load_env()
+
     if not args.i_mean_it:
-        log.warning("Dry-run (no --i-mean-it). Plan:")
-        log.warning("  1. Load credentials from env")
-        log.warning("  2. POST signed BUY @ %s (size $%s)", args.far_price, args.size_usd)
-        log.warning("  3. Sleep 3s")
-        log.warning("  4. DELETE (cancel) the order")
-        log.warning("Re-run with --i-mean-it to execute.")
+        _print_plan(args)
         return 0
 
-    return asyncio.run(_run(args.token_id, args.far_price, args.size_usd))
+    missing = _validate_env()
+    if missing:
+        log.error("Missing required env vars: %s. See .env.example.", missing)
+        return 2
+
+    return asyncio.run(_run(args.token_id, args.far_price, args.size_usd, testnet=args.testnet))
 
 
 if __name__ == "__main__":

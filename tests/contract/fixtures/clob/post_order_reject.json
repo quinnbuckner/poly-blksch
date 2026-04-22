@@ -1,0 +1,9 @@
+{
+  "errorMsg": "insufficient balance",
+  "orderID": "",
+  "takingAmount": "",
+  "makingAmount": "",
+  "status": "",
+  "success": false,
+  "transactionsHashes": null
+}

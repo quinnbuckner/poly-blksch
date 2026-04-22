@@ -1,0 +1,37 @@
+{
+  "limit": "500",
+  "count": "2",
+  "next_cursor": "MTAwMA==",
+  "data": [
+    {
+      "condition_id": "0xcond1111111111111111111111111111111111111111111111111111111111",
+      "question_id": "0x1111",
+      "question": "Will X happen by end of 2026?",
+      "market_slug": "will-x-happen-by-end-2026",
+      "end_date_iso": "2026-12-31T23:59:59Z",
+      "active": true,
+      "closed": false,
+      "minimum_order_size": "5",
+      "minimum_tick_size": "0.01",
+      "tokens": [
+        {"token_id": "11111111111111111111111111111111111111111111111111111111111111111111", "outcome": "Yes", "price": 0.55, "winner": false},
+        {"token_id": "22222222222222222222222222222222222222222222222222222222222222222222", "outcome": "No",  "price": 0.45, "winner": false}
+      ]
+    },
+    {
+      "condition_id": "0xcond2222222222222222222222222222222222222222222222222222222222",
+      "question_id": "0x2222",
+      "question": "Will Y happen by March 2026?",
+      "market_slug": "will-y-happen-by-march-2026",
+      "end_date_iso": "2026-03-31T23:59:59Z",
+      "active": true,
+      "closed": false,
+      "minimum_order_size": "5",
+      "minimum_tick_size": "0.001",
+      "tokens": [
+        {"token_id": "33333333333333333333333333333333333333333333333333333333333333333333", "outcome": "Yes", "price": 0.12, "winner": false},
+        {"token_id": "44444444444444444444444444444444444444444444444444444444444444444444", "outcome": "No",  "price": 0.88, "winner": false}
+      ]
+    }
+  ]
+}
