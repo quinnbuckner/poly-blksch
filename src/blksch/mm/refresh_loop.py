@@ -36,6 +36,7 @@ from blksch.schemas import (
 
 from .guards import GuardDecision, GuardState
 from .hedge.beta import BetaHedgeParams, compute_beta_hedge
+from .hedge.calendar import CalendarHedgeParams, compute_calendar_hedge
 from .limits import LimitsConfig, LimitsState, inventory_cap_contracts
 from .quote import QuoteParams, compute_quote
 
@@ -80,6 +81,10 @@ class MarketSnapshot:
     trades: tuple[TradeTick, ...] = ()
     time_to_horizon_sec: float = 3600.0
     hedge_peers: tuple[HedgePeer, ...] = ()
+    # Aggregate belief-vol sensitivity of the book over the calendar window.
+    # Populated by the PnL attribution pipeline / variance book; None until
+    # Stage-3 is ready to supply it, in which case the calendar hedge is skipped.
+    inventory_nu_b: float | None = None
 
 
 class DataFeed(Protocol):
@@ -106,6 +111,10 @@ class LoopConfig:
     # Stage-2 β-hedge: off by default — only flips on after Stage 1 paper gate.
     hedge_enabled: bool = False
     hedge_params: BetaHedgeParams = field(default_factory=BetaHedgeParams)
+    # Stage-3 calendar (variance-strip) hedge: off by default — flips on after
+    # Stage 2 paper-trading validation AND synth_strip.py routing is wired.
+    calendar_hedge_enabled: bool = False
+    calendar_hedge_params: CalendarHedgeParams = field(default_factory=CalendarHedgeParams)
     max_cycles: int | None = None  # None = run forever; tests set a small int
 
 
@@ -265,7 +274,13 @@ class RefreshLoop:
         ):
             await self._emit_hedges(snap, now)
 
-        # --- Step 6: calendar rebalance (Stage 3, stub) ---------------------
+        # --- Step 6: calendar rebalance (Stage 3, gated) --------------------
+        if (
+            self.config.calendar_hedge_enabled
+            and self.hedge_sink is not None
+            and snap.inventory_nu_b is not None
+        ):
+            await self._emit_calendar_hedge(snap, now)
 
         return quote
 
@@ -311,6 +326,33 @@ class RefreshLoop:
                     "hedge_sink failed for %s→%s",
                     instruction.source_token_id, instruction.hedge_token_id,
                 )
+
+    async def _emit_calendar_hedge(self, snap: MarketSnapshot, now: datetime) -> None:
+        """Stage-3 calendar rebalance (paper §4.3, refresh_loop step 6).
+
+        Sizes an x-variance strip against the book's aggregate belief-vol
+        sensitivity. Zero-notional instructions (ν̂_b == 0) are suppressed.
+        """
+        if self.hedge_sink is None or snap.inventory_nu_b is None:
+            return
+        try:
+            instruction = compute_calendar_hedge(
+                surface=snap.surface,
+                inventory_nu_b=snap.inventory_nu_b,
+                params=self.config.calendar_hedge_params,
+                ts=now,
+            )
+        except Exception:
+            logger.exception("calendar hedge calc failed for %s", snap.token_id)
+            return
+        if instruction.notional_usd <= 0.0:
+            return
+        try:
+            await self.hedge_sink(instruction)
+        except Exception:
+            logger.exception(
+                "hedge_sink failed for calendar %s", instruction.source_token_id
+            )
 
     async def _emit_pull(self, token_id: str, reason: str) -> None:
         if self.pull_sink is not None:

@@ -69,7 +69,7 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 | `pnl.py` | ✅ | §4.6 | Δ–Γ–ν_b–ν_ρ–jump attribution; realized vs expected (dp)² |
 | `limits.py` | ✅ | §4.6 | Feed-gap / vol spike / pickoff / drawdown / swing-zone Γ |
 | `hedge/beta.py` | 🟡 | §4.4 | Cross-event β-hedge — built, runtime-flagged `hedge_enabled=False` until Stage-1 paper gate |
-| `hedge/calendar.py` | ⬜ | §4.3 | Variance-strip sizing (Stage 3) |
+| `hedge/calendar.py` | 🟡 | §4.3 | Variance-strip sizing — built, `calendar_hedge_enabled=False` until Stage-3 gate; synth leg names `{tok}:xvar` are unroutable until synth_strip.py lands |
 | `hedge/synth_strip.py` | ⬜ | §3.4 | Synthetic variance/corridor (Stage 3) |
 
 ## Track C — Execution & Infra (`src/blksch/exec/`)
