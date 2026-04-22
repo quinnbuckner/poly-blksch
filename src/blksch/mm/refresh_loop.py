@@ -36,7 +36,8 @@ from blksch.schemas import (
 
 from .guards import GuardDecision, GuardState
 from .hedge.beta import BetaHedgeParams, compute_beta_hedge
-from .hedge.calendar import CalendarHedgeParams, compute_calendar_hedge
+from .hedge.calendar import CalendarHedgeParams, compute_calendar_hedge, resolve_with_synth_strip
+from .hedge.synth_strip import SynthStripParams
 from .limits import LimitsConfig, LimitsState, inventory_cap_contracts
 from .quote import QuoteParams, compute_quote
 
@@ -85,6 +86,11 @@ class MarketSnapshot:
     # Populated by the PnL attribution pipeline / variance book; None until
     # Stage-3 is ready to supply it, in which case the calendar hedge is skipped.
     inventory_nu_b: float | None = None
+    # Adjacent surface points at other (m, τ) used by synth_strip to fan the
+    # synthetic `{tok}:xvar` leg out into a basket of routable tokens. Empty
+    # when synth_strip is disabled (the refresh loop then suppresses the
+    # unroutable synthetic leg rather than emit it).
+    surface_neighborhood: tuple[SurfacePoint, ...] = ()
 
 
 class DataFeed(Protocol):
@@ -115,6 +121,13 @@ class LoopConfig:
     # Stage 2 paper-trading validation AND synth_strip.py routing is wired.
     calendar_hedge_enabled: bool = False
     calendar_hedge_params: CalendarHedgeParams = field(default_factory=CalendarHedgeParams)
+    # Stage-3 synthetic-strip resolver: when on together with
+    # `calendar_hedge_enabled`, the unroutable `{tok}:xvar` leg emitted by
+    # calendar.py is exploded into a basket of real tokens via
+    # hedge.synth_strip.replicate_xvariance_strip. When off, the calendar
+    # hedge still emits the synthetic leg — the router decides what to do.
+    synth_strip_enabled: bool = False
+    synth_strip_params: SynthStripParams = field(default_factory=SynthStripParams)
     max_cycles: int | None = None  # None = run forever; tests set a small int
 
 
@@ -328,10 +341,16 @@ class RefreshLoop:
                 )
 
     async def _emit_calendar_hedge(self, snap: MarketSnapshot, now: datetime) -> None:
-        """Stage-3 calendar rebalance (paper §4.3, refresh_loop step 6).
+        """Stage-3 calendar rebalance (paper §4.3 + §3.4, refresh_loop step 6).
 
         Sizes an x-variance strip against the book's aggregate belief-vol
         sensitivity. Zero-notional instructions (ν̂_b == 0) are suppressed.
+
+        When `config.synth_strip_enabled` is on AND the MarketSnapshot carries
+        a `surface_neighborhood`, the synthetic `{tok}:xvar` leg is exploded
+        into a basket of real-token HedgeInstructions via
+        hedge.synth_strip.replicate_xvariance_strip (paper §3.4). Otherwise
+        the synthetic leg is emitted as-is and the router decides.
         """
         if self.hedge_sink is None or snap.inventory_nu_b is None:
             return
@@ -347,6 +366,43 @@ class RefreshLoop:
             return
         if instruction.notional_usd <= 0.0:
             return
+
+        # Stage-3 synthetic-strip fan-out (paper §3.4). When the flag is on,
+        # we either emit a routable basket or suppress — never an unroutable
+        # `{tok}:xvar` leg.
+        if self.config.synth_strip_enabled:
+            try:
+                basket = resolve_with_synth_strip(
+                    instruction=instruction,
+                    surface_points=snap.surface_neighborhood,
+                    target_tau=snap.surface.tau,
+                    target_m=snap.surface.m,
+                    params=self.config.synth_strip_params,
+                )
+            except Exception:
+                logger.exception(
+                    "synth_strip resolve failed for %s; suppressing hedge",
+                    snap.token_id,
+                )
+                return
+            if not basket:
+                # No routable neighbors — suppress rather than emit the
+                # unroutable synthetic leg.
+                logger.info(
+                    "synth_strip produced empty basket for %s; suppressing hedge",
+                    snap.token_id,
+                )
+                return
+            for leg in basket:
+                try:
+                    await self.hedge_sink(leg)
+                except Exception:
+                    logger.exception(
+                        "hedge_sink failed for synth_strip leg %s→%s",
+                        leg.source_token_id, leg.hedge_token_id,
+                    )
+            return
+
         try:
             await self.hedge_sink(instruction)
         except Exception:

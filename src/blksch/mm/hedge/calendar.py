@@ -27,12 +27,16 @@ The function is pure: no IO, no state.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Iterable
 
 from blksch.schemas import HedgeInstruction, HedgeSide, SurfacePoint
+
+from .synth_strip import SynthStripParams, explode_hedge_into_basket
 
 __all__ = [
     "CalendarHedgeParams",
     "compute_calendar_hedge",
+    "resolve_with_synth_strip",
     "xvar_synth_token_id",
 ]
 
@@ -109,3 +113,40 @@ def compute_calendar_hedge(
     side = HedgeSide.LONG if raw_notional > 0.0 else HedgeSide.SHORT
 
     return base_instr.model_copy(update={"notional_usd": abs_notional, "side": side})
+
+
+def resolve_with_synth_strip(
+    instruction: HedgeInstruction,
+    surface_points: Iterable[SurfacePoint],
+    target_tau: float,
+    target_m: float,
+    *,
+    params: SynthStripParams | None = None,
+) -> list[HedgeInstruction]:
+    """Turn a synthetic `{tok}:xvar` calendar HedgeInstruction into a basket
+    of concrete-token HedgeInstructions the order router can handle (paper §3.4).
+
+    Usage from refresh_loop step 6:
+
+        legs = resolve_with_synth_strip(
+            instruction=compute_calendar_hedge(...),
+            surface_points=snap.surface_neighborhood,
+            target_tau=snap.surface.tau,
+            target_m=snap.surface.m,
+            params=config.synth_strip_params,
+        )
+        for leg in legs:
+            await hedge_sink(leg)
+
+    Returns [] when the input is zero-notional or when no surface neighbors
+    are available — the caller should fall back to emitting the synthetic
+    instruction only if the router declares it handles `:xvar` tokens
+    (Stage 3 router work).
+    """
+    return explode_hedge_into_basket(
+        instruction=instruction,
+        surface_points=surface_points,
+        target_tau=target_tau,
+        target_m=target_m,
+        params=params,
+    )
