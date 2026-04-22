@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from blksch.schemas import Fill, Position, Quote, SurfacePoint
+from blksch.schemas import BookSnap, Fill, Position, Quote, SurfacePoint
 
 from .ledger import Ledger, PnLSnapshot
 from .paper_engine import PaperEngineState
@@ -33,16 +33,34 @@ _MAX_FILL_HISTORY = 50
 
 
 @dataclass
+class StalenessThresholds:
+    """Seconds-based thresholds for the staleness pane. Age < fresh is green,
+    < warn is yellow, otherwise red. ``None`` age (never published) renders dim."""
+
+    fresh_sec: float = 5.0
+    warn_sec: float = 30.0
+
+
+@dataclass
 class DashboardContext:
-    """Shared observer state. Readers must treat it as read-only."""
+    """Shared observer state. Readers must treat it as read-only.
+
+    Track A calls ``on_book`` / ``on_surface`` as messages land. Track B calls
+    ``on_quote``. Track C (paper engine / order router) calls ``on_fill``.
+    Nothing here mutates trading state — the dashboard is purely an observer,
+    so a missing publisher is never fatal: staleness simply reads ``None``
+    until the upstream channel comes online.
+    """
 
     ledger: Ledger
     mode: str = "paper"
     quotes: dict[str, Quote] = field(default_factory=dict)  # token_id -> latest Quote
     surface: dict[str, SurfacePoint] = field(default_factory=dict)  # token_id -> latest
+    last_book_ts: dict[str, datetime] = field(default_factory=dict)  # token_id -> latest BookSnap.ts
     engine_state: PaperEngineState | None = None
     recent_fills: deque[Fill] = field(default_factory=lambda: deque(maxlen=_MAX_FILL_HISTORY))
     kill_switches: dict[str, bool] = field(default_factory=dict)
+    staleness_thresholds: StalenessThresholds = field(default_factory=StalenessThresholds)
 
     def on_quote(self, quote: Quote) -> None:
         self.quotes[quote.token_id] = quote
@@ -50,8 +68,35 @@ class DashboardContext:
     def on_surface(self, point: SurfacePoint) -> None:
         self.surface[point.token_id] = point
 
+    def on_book(self, snap: BookSnap) -> None:
+        """Record that a BookSnap arrived for ``token_id``. The snap itself
+        is not retained — only the timestamp — because the dashboard does not
+        re-render the full order book, only its freshness."""
+        self.last_book_ts[snap.token_id] = snap.ts
+
     def on_fill(self, fill: Fill) -> None:
         self.recent_fills.append(fill)
+
+    def staleness(self, *, now: datetime | None = None) -> dict[str, dict[str, float | None]]:
+        """Per-token data-staleness map::
+
+            {token_id: {"book_age_sec": float|None, "surface_age_sec": float|None}}
+
+        Ages are ``None`` for tokens whose publisher has not fired yet. Tokens
+        appear here if they appear in *any* tracked source (book, surface, or
+        quote) so the pane can flag "quoting but no surface" asymmetries.
+        """
+        ref = now or datetime.now(UTC)
+        tokens = set(self.last_book_ts) | set(self.surface) | set(self.quotes)
+        out: dict[str, dict[str, float | None]] = {}
+        for tok in sorted(tokens):
+            book_ts = self.last_book_ts.get(tok)
+            surf = self.surface.get(tok)
+            out[tok] = {
+                "book_age_sec": (ref - book_ts).total_seconds() if book_ts else None,
+                "surface_age_sec": (ref - surf.ts).total_seconds() if surf else None,
+            }
+        return out
 
     def snapshot_dict(self) -> dict[str, Any]:
         pnl = self.ledger.pnl()
@@ -68,6 +113,7 @@ class DashboardContext:
             "positions": [_position_dict(p) for p in positions],
             "quotes": {k: _quote_dict(q) for k, q in self.quotes.items()},
             "surface": {k: _surface_dict(s) for k, s in self.surface.items()},
+            "staleness": self.staleness(),
             "engine": _engine_dict(self.engine_state) if self.engine_state else None,
             "kill_switches": dict(self.kill_switches),
             "recent_fills": [_fill_dict(f) for f in list(self.recent_fills)[-10:]],
@@ -160,6 +206,45 @@ class RichDashboard:
             if engine.get("halt_reason"):
                 ks_text.append(f" ({engine['halt_reason']})", style="red dim")
 
+        # Surface pane (σ̂_b, λ̂ per token from Track A). Activates when
+        # SurfacePoint messages start landing; empty until then.
+        surf_t = Table(title="Belief surface (Track A)", expand=True)
+        surf_t.add_column("token_id")
+        surf_t.add_column("τ (s)",    justify="right")
+        surf_t.add_column("σ̂_b",      justify="right")
+        surf_t.add_column("λ̂",        justify="right")
+        surf_t.add_column("ŝ²_J",     justify="right")
+        surf_t.add_column("unc.",     justify="right")
+        if snap["surface"]:
+            for k, s in snap["surface"].items():
+                surf_t.add_row(
+                    k[:12] + "…" if len(k) > 12 else k,
+                    f"{s['tau']:.0f}",
+                    f"{s['sigma_b']:.4f}",
+                    f"{s['lambda']:.4f}",
+                    f"{s['s2_j']:.4f}",
+                    "—" if s["uncertainty"] is None else f"{s['uncertainty']:.3f}",
+                )
+        else:
+            surf_t.add_row("[dim]waiting on Track A…[/dim]", "", "", "", "", "")
+
+        # Staleness pane — last BookSnap age (Track A ingest) and last
+        # SurfacePoint age (Track A calibration) per token.
+        stale_t = Table(title="Data staleness", expand=True)
+        stale_t.add_column("token_id")
+        stale_t.add_column("BookSnap age",    justify="right")
+        stale_t.add_column("SurfacePoint age", justify="right")
+        thresholds = self.ctx.staleness_thresholds
+        if snap["staleness"]:
+            for k, s in snap["staleness"].items():
+                stale_t.add_row(
+                    k[:12] + "…" if len(k) > 12 else k,
+                    _fmt_age(s["book_age_sec"], thresholds),
+                    _fmt_age(s["surface_age_sec"], thresholds),
+                )
+        else:
+            stale_t.add_row("[dim]no publishers yet[/dim]", "", "")
+
         # Recent fills
         f_t = Table(title="Recent fills", expand=True)
         f_t.add_column("ts")
@@ -181,6 +266,7 @@ class RichDashboard:
             Layout(Panel(mode_text, border_style="blue"), size=3),
             Layout(name="top", ratio=1),
             Layout(name="mid", ratio=1),
+            Layout(name="surf", ratio=1),
             Layout(Panel(ks_text, title="Kill-switches", border_style="magenta"), size=3),
             Layout(Panel(f_t, border_style="white"), ratio=1),
         )
@@ -189,6 +275,10 @@ class RichDashboard:
             Layout(Panel(pos_t, border_style="cyan")),
         )
         layout["mid"].update(Panel(q_t, border_style="yellow"))
+        layout["surf"].split_row(
+            Layout(Panel(surf_t, border_style="blue")),
+            Layout(Panel(stale_t, border_style="red")),
+        )
         return layout
 
     async def run(self, stop_event=None) -> None:
@@ -246,6 +336,26 @@ class FlaskDashboard:
 def _fmt_usd(x: float) -> str:
     style = "green" if x >= 0 else "red"
     return f"[{style}]${x:+.4f}[/{style}]"
+
+
+def _fmt_age(age_sec: float | None, thresholds: StalenessThresholds) -> str:
+    """Color-code a staleness age for the Rich pane. ``None`` means the
+    publisher has never fired — render dim rather than hot-red."""
+    if age_sec is None:
+        return "[dim]never[/dim]"
+    if age_sec < thresholds.fresh_sec:
+        style = "green"
+    elif age_sec < thresholds.warn_sec:
+        style = "yellow"
+    else:
+        style = "bold red"
+    if age_sec < 60:
+        label = f"{age_sec:.1f}s"
+    elif age_sec < 3600:
+        label = f"{age_sec / 60:.1f}m"
+    else:
+        label = f"{age_sec / 3600:.1f}h"
+    return f"[{style}]{label}[/{style}]"
 
 
 def _position_dict(p: Position) -> dict[str, Any]:
