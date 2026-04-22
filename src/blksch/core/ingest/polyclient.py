@@ -247,6 +247,31 @@ class PolyClient:
             return data
         return data.get("data") or data.get("markets") or []
 
+    async def list_markets(
+        self,
+        *,
+        page_size: int = 100,
+        max_markets: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Page through the Gamma markets listing until exhausted.
+
+        Stops when a page comes back short (fewer than ``page_size`` rows) or
+        when ``max_markets`` is reached. Returns the accumulated list.
+        """
+        out: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = await self.get_markets(limit=page_size, offset=offset)
+            if not page:
+                break
+            out.extend(page)
+            if len(page) < page_size:
+                break
+            if max_markets is not None and len(out) >= max_markets:
+                return out[:max_markets]
+            offset += page_size
+        return out
+
     async def get_clob_market(self, condition_id: str) -> dict[str, Any]:
         await self._limiter.acquire()
         async with self.session.get(
