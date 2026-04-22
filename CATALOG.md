@@ -68,7 +68,7 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 | `refresh_loop.py` | ✅ | §4.5 | 100–500 ms asyncio cycle; per-token state; pluggable sinks |
 | `pnl.py` | ✅ | §4.6 | Δ–Γ–ν_b–ν_ρ–jump attribution; realized vs expected (dp)² |
 | `limits.py` | ✅ | §4.6 | Feed-gap / vol spike / pickoff / drawdown / swing-zone Γ |
-| `hedge/beta.py` | ⬜ | §4.4 | Cross-event β-hedge (Stage 2) |
+| `hedge/beta.py` | 🟡 | §4.4 | Cross-event β-hedge — built, runtime-flagged `hedge_enabled=False` until Stage-1 paper gate |
 | `hedge/calendar.py` | ⬜ | §4.3 | Variance-strip sizing (Stage 3) |
 | `hedge/synth_strip.py` | ⬜ | §3.4 | Synthetic variance/corridor (Stage 3) |
 

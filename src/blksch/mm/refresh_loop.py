@@ -25,6 +25,7 @@ from typing import Awaitable, Callable, Protocol
 
 from blksch.schemas import (
     BookSnap,
+    CorrelationEntry,
     HedgeInstruction,
     LogitState,
     Position,
@@ -34,10 +35,12 @@ from blksch.schemas import (
 )
 
 from .guards import GuardDecision, GuardState
+from .hedge.beta import BetaHedgeParams, compute_beta_hedge
 from .limits import LimitsConfig, LimitsState, inventory_cap_contracts
 from .quote import QuoteParams, compute_quote
 
 __all__ = [
+    "HedgePeer",
     "MarketSnapshot",
     "DataFeed",
     "LoopConfig",
@@ -53,10 +56,20 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class HedgePeer:
+    """One hedge candidate attached to a MarketSnapshot (Stage 2)."""
+
+    surface: SurfacePoint
+    correlation: CorrelationEntry
+
+
+@dataclass(frozen=True)
 class MarketSnapshot:
     """Everything the quote builder needs on one tick.
 
     `book` and `position` may be None briefly during warm-up.
+    `hedge_peers` is populated only when Stage-2 β-hedging is desired; empty
+    otherwise.
     """
 
     token_id: str
@@ -66,6 +79,7 @@ class MarketSnapshot:
     book: BookSnap | None
     trades: tuple[TradeTick, ...] = ()
     time_to_horizon_sec: float = 3600.0
+    hedge_peers: tuple[HedgePeer, ...] = ()
 
 
 class DataFeed(Protocol):
@@ -89,6 +103,9 @@ class LoopConfig:
     refresh_ms: int = 250
     quote: QuoteParams = field(default_factory=QuoteParams)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
+    # Stage-2 β-hedge: off by default — only flips on after Stage 1 paper gate.
+    hedge_enabled: bool = False
+    hedge_params: BetaHedgeParams = field(default_factory=BetaHedgeParams)
     max_cycles: int | None = None  # None = run forever; tests set a small int
 
 
@@ -239,12 +256,61 @@ class RefreshLoop:
         state.last_quote = quote
         await self.quote_sink(quote)
 
-        # --- Steps 5-6 are stubbed until Stage 2/3 --------------------------
-        # (See mm/hedge/*.py — unused at Stage 1.)
+        # --- Step 5: cross-event rebalance (Stage 2, gated) -----------------
+        if (
+            self.config.hedge_enabled
+            and self.hedge_sink is not None
+            and snap.hedge_peers
+            and snap.position is not None
+        ):
+            await self._emit_hedges(snap, now)
+
+        # --- Step 6: calendar rebalance (Stage 3, stub) ---------------------
 
         return quote
 
     # -- internals ----------------------------------------------------------
+
+    async def _emit_hedges(self, snap: MarketSnapshot, now: datetime) -> None:
+        """Stage-2 β-hedge step (paper §4.4, refresh_loop step 5).
+
+        For each peer in `snap.hedge_peers`, compute β̃ scaled by the current
+        target notional and forward the resulting HedgeInstruction to the
+        hedge_sink. Zero-notional instructions are suppressed.
+
+        `target_notional_usd` here uses the signed mark-to-market of the
+        target position; side flips automatically when the target is short.
+        """
+        if snap.position is None or self.hedge_sink is None:
+            return
+        target_notional = snap.position.qty * snap.position.mark
+        if target_notional == 0.0:
+            return
+        for peer in snap.hedge_peers:
+            try:
+                instruction = compute_beta_hedge(
+                    target=snap.surface,
+                    hedge=peer.surface,
+                    corr=peer.correlation,
+                    alpha=self.config.hedge_params.alpha,
+                    params=self.config.hedge_params,
+                    target_notional_usd=target_notional,
+                    ts=now,
+                )
+            except ValueError:
+                logger.exception(
+                    "hedge calc failed for %s→%s", snap.token_id, peer.surface.token_id,
+                )
+                continue
+            if instruction.notional_usd <= 0.0:
+                continue
+            try:
+                await self.hedge_sink(instruction)
+            except Exception:
+                logger.exception(
+                    "hedge_sink failed for %s→%s",
+                    instruction.source_token_id, instruction.hedge_token_id,
+                )
 
     async def _emit_pull(self, token_id: str, reason: str) -> None:
         if self.pull_sink is not None:
