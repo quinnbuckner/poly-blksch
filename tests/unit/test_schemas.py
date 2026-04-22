@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from blksch.schemas import (
     BookSnap,
     CorrelationEntry,
@@ -33,8 +35,8 @@ def test_book_snap_mid_and_spread() -> None:
         asks=[PriceLevel(price=0.52, size=100)],
         ts=_now(),
     )
-    assert snap.mid == 0.5
-    assert snap.spread == 0.04
+    assert snap.mid == pytest.approx(0.5)
+    assert snap.spread == pytest.approx(0.04)
 
 
 def test_trade_tick_roundtrip() -> None:
