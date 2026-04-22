@@ -50,6 +50,18 @@ where = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+markers = [
+  "unit: fast, pure-math tests (default in CI)",
+  "integration: per-track tests with fixtures (CI)",
+  "pipeline: end-to-end, may run minutes (nightly / pre-promotion)",
+  "contract: pinned against recorded Polymarket responses (CI, offline)",
+  "live_ro: hits live Polymarket read-only endpoints (manual; skip by default)",
+  "canary: live signed endpoints with tiny size (manual; gate for Stage 2)",
+  "slow: > 30 seconds; excluded from fast CI",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100
