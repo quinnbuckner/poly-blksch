@@ -4,7 +4,7 @@
 
 **Responsibility:** submit orders to either `paper_engine` (Stage 1) or the Polymarket CLOB (Stage 2+). Maintain the authoritative ledger of positions, fills, fees, and PnL. Provide the live dashboard.
 
-**Status:** ⬜ pending. Day-0 scaffold only.
+**Status:** ✅ Stage 1 complete. Paper engine, ledger, signer, router, and dashboard are shipped with unit + integration tests green. Stage 2 (live CLOB routing) is wired but gated on `RouterConfig.live_ack=True` — no real orders can be placed until that flag is set.
 
 > Note on the name `exec`: shadows Python's `exec()` builtin only inside `blksch.exec`. Not actually a problem — Python treats it as a regular identifier — but don't `from blksch.exec import *`.
 
@@ -21,24 +21,28 @@
 
 ## Files
 
-| File | Stage | Notes |
-|---|---|---|
-| `clob_client.py` | 1 (read), 2 (write) | Polymarket CLOB REST. Try `py-clob-client` first; fall back to custom if stale |
-| `signer.py` | 2 | EIP-712 typed-data signing (`eth-account`) — only if not using py-clob-client |
-| `ledger.py` | 1 | SQLite: positions, fills, fees, realized/unrealized PnL |
-| `paper_engine.py` | 1 | Simulated matching against live L2 book with conservative queue model |
-| `order_router.py` | 1 | Idempotent place / cancel / replace, retry/backoff, routes paper vs. live |
-| `dashboard.py` | 1 | Rich terminal view + optional Flask endpoint |
+| File | Stage | Status | Notes |
+|---|---|---|---|
+| `clob_client.py` | 1 (read), 2 (write) | ✅ | `make_clob_client()` auto-picks `PyCLOBClient` (py-clob-client adapter, async via `to_thread`) or `HttpCLOBClient` (aiohttp read-only fallback). Returns `BookSnap` / `Order` — never raw upstream types. |
+| `signer.py` | 2 | ✅ | EIP-712 Polymarket CTF Exchange v1 typed-data signer; deterministic, signature recovery verified. Used only when falling back off `py-clob-client`. |
+| `ledger.py` | 1 | ✅ | SQLite (WAL) ledger for orders/fills/positions/marks. Signed-qty WAP accounting with sign-flip handling; fees reduce realized PnL. `reconcile()` is a pure-Python cross-check used by tests. |
+| `paper_engine.py` | 1 | ✅ | Conservative matcher: fills on book trade-through or opposite-aggressor TradeTick; `queue_haircut` (default 0.5) models queue position; halts on `feed_gap_sec`. |
+| `order_router.py` | 1 | ✅ | Idempotent `sync_quote(Quote)` aligns resting orders to the target; `place`/`cancel`/`replace`/`cancel_all` primitives; exponential backoff + jitter retry. Live mode refuses to construct unless `RouterConfig.live_ack=True`. |
+| `dashboard.py` | 1 | ✅ | `RichDashboard` (asyncio `rich.Live` loop) + `FlaskDashboard` (`/api/state`, `/api/pnl`, `/api/health`). Both read from a shared `DashboardContext` — never mutate bot state. |
 
-## Build order
+## Interfaces
 
-See the plan's Window-3 prompt. Ship each with unit tests:
+* **Schemas (frozen):** router consumes `Quote`; router/engine emit `Order`/`Fill`; ledger returns `Position`. See `blksch/schemas.py`.
+* **Public entry points:** `OrderRouter.sync_quote(Quote)` is the only call Track B's refresh loop needs. `PaperEngine.on_book(BookSnap)` / `PaperEngine.on_trade(TradeTick)` are the only calls Track A's polyclient needs.
+* **Mode routing:** Stage 1 wires `OrderRouter(paper_backend=PaperEngine(...))`; Stage 2 swaps to `OrderRouter(live_backend=make_clob_client(...), config=RouterConfig(mode="live", live_ack=True))`.
 
-1. `clob_client.py` (read-only endpoints first)
-2. `ledger.py`
-3. `paper_engine.py`
-4. `order_router.py`
-5. `dashboard.py`
+## Build order (historic)
+
+1. ✅ `clob_client.py` + `signer.py`
+2. ✅ `ledger.py`
+3. ✅ `paper_engine.py`
+4. ✅ `order_router.py`
+5. ✅ `dashboard.py`
 
 ## Paper engine (Stage 1) matching model
 
