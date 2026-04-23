@@ -1,0 +1,131 @@
+{
+  "cumulative": {
+    "belief_vega": "0.0",
+    "cross_event": "0.0",
+    "curvature": "-0.093290249759513",
+    "directional": "-0.4474695002897751",
+    "jump": "0.04075975004928784",
+    "total": "-0.5000000000000003"
+  },
+  "steps": [
+    {
+      "input": {
+        "p": "0.5",
+        "qty": "0.0",
+        "sigma_b": "0.05",
+        "t_offset": 0
+      },
+      "step": null
+    },
+    {
+      "input": {
+        "p": "0.52",
+        "qty": "10.0",
+        "sigma_b": "0.05",
+        "t_offset": 1
+      },
+      "step": {
+        "belief_vega_pnl": "0.0",
+        "cross_event_pnl": "0.0",
+        "curvature_pnl": "0.0",
+        "directional_pnl": "0.0",
+        "dp": "0.020000000000000018",
+        "dsigma_b": "0.0",
+        "expected_dp2": "0.00015625000000000003",
+        "jump_pnl": "0.0",
+        "realized_dp2": "0.0004000000000000007",
+        "token_id": "T",
+        "total": "0.0",
+        "ts": "datetime.datetime(2026, 4, 23, 12, 0, 1, tzinfo=datetime.timezone.utc)"
+      }
+    },
+    {
+      "input": {
+        "p": "0.55",
+        "qty": "10.0",
+        "sigma_b": "0.06",
+        "t_offset": 2
+      },
+      "step": {
+        "belief_vega_pnl": "0.0",
+        "cross_event_pnl": "0.0",
+        "curvature_pnl": "-0.0007263914829814768",
+        "directional_pnl": "0.30108745752038263",
+        "dp": "0.030000000000000027",
+        "dsigma_b": "0.009999999999999995",
+        "expected_dp2": "0.0001557504",
+        "jump_pnl": "-0.0003610660374008854",
+        "realized_dp2": "0.0009000000000000016",
+        "token_id": "T",
+        "total": "0.30000000000000027",
+        "ts": "datetime.datetime(2026, 4, 23, 12, 0, 2, tzinfo=datetime.timezone.utc)"
+      }
+    },
+    {
+      "input": {
+        "p": "0.6",
+        "qty": "10.0",
+        "sigma_b": "0.06",
+        "t_offset": 3
+      },
+      "step": {
+        "belief_vega_pnl": "0.0",
+        "cross_event_pnl": "0.0",
+        "curvature_pnl": "-0.005190167992064394",
+        "directional_pnl": "0.5068661712988817",
+        "dp": "0.04999999999999993",
+        "dsigma_b": "0.0",
+        "expected_dp2": "0.00022052249999999997",
+        "jump_pnl": "-0.0016760033068179457",
+        "realized_dp2": "0.0024999999999999935",
+        "token_id": "T",
+        "total": "0.49999999999999933",
+        "ts": "datetime.datetime(2026, 4, 23, 12, 0, 3, tzinfo=datetime.timezone.utc)"
+      }
+    },
+    {
+      "input": {
+        "p": "0.45",
+        "qty": "10.0",
+        "sigma_b": "0.08",
+        "t_offset": 4
+      },
+      "step": {
+        "belief_vega_pnl": "0.0",
+        "cross_event_pnl": "0.0",
+        "curvature_pnl": "-0.08817614696875967",
+        "directional_pnl": "-1.454725928568757",
+        "dp": "-0.14999999999999997",
+        "dsigma_b": "0.020000000000000004",
+        "expected_dp2": "0.00020736",
+        "jump_pnl": "0.042902075537517154",
+        "realized_dp2": "0.02249999999999999",
+        "token_id": "T",
+        "total": "-1.4999999999999996",
+        "ts": "datetime.datetime(2026, 4, 23, 12, 0, 4, tzinfo=datetime.timezone.utc)"
+      }
+    },
+    {
+      "input": {
+        "p": "0.47",
+        "qty": "5.0",
+        "sigma_b": "0.07",
+        "t_offset": 5
+      },
+      "step": {
+        "belief_vega_pnl": "0.0",
+        "cross_event_pnl": "0.0",
+        "curvature_pnl": "0.0008024566842925331",
+        "directional_pnl": "0.19930279945971757",
+        "dp": "0.019999999999999962",
+        "dsigma_b": "-0.009999999999999995",
+        "expected_dp2": "0.00039204000000000013",
+        "jump_pnl": "-0.00010525614401048287",
+        "realized_dp2": "0.0003999999999999985",
+        "token_id": "T",
+        "total": "0.19999999999999962",
+        "ts": "datetime.datetime(2026, 4, 23, 12, 0, 5, tzinfo=datetime.timezone.utc)"
+      }
+    }
+  ]
+}

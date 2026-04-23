@@ -1,0 +1,92 @@
+[
+  {
+    "input": {
+      "alpha": "0.8",
+      "co_jump": false,
+      "rho": "0.6"
+    },
+    "output": {
+      "hedge_token_id": "HDG",
+      "notional_usd": "47.0534336501597",
+      "reason": "beta",
+      "side": "short",
+      "source_token_id": "TGT",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "input": {
+      "alpha": "0.8",
+      "co_jump": false,
+      "rho": "-0.6"
+    },
+    "output": {
+      "hedge_token_id": "HDG",
+      "notional_usd": "47.0534336501597",
+      "reason": "beta",
+      "side": "long",
+      "source_token_id": "TGT",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "input": {
+      "alpha": "0.8",
+      "co_jump": false,
+      "rho": "0.0"
+    },
+    "output": {
+      "hedge_token_id": "HDG",
+      "notional_usd": "0.0",
+      "reason": "beta",
+      "side": "short",
+      "source_token_id": "TGT",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "input": {
+      "alpha": "0.5",
+      "co_jump": false,
+      "rho": "0.95"
+    },
+    "output": {
+      "hedge_token_id": "HDG",
+      "notional_usd": "46.56329371630387",
+      "reason": "beta",
+      "side": "short",
+      "source_token_id": "TGT",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "input": {
+      "alpha": "1.0",
+      "co_jump": false,
+      "rho": "0.6"
+    },
+    "output": {
+      "hedge_token_id": "HDG",
+      "notional_usd": "58.81679206269962",
+      "reason": "beta",
+      "side": "short",
+      "source_token_id": "TGT",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "input": {
+      "alpha": "0.8",
+      "co_jump": true,
+      "rho": "0.6"
+    },
+    "output": {
+      "hedge_token_id": "HDG",
+      "notional_usd": "49.28679015789367",
+      "reason": "beta",
+      "side": "short",
+      "source_token_id": "TGT",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  }
+]

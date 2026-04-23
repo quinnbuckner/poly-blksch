@@ -1,0 +1,101 @@
+[
+  {
+    "forward_filled": false,
+    "p_tilde": "0.5",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "1.0",
+    "y": "0.0"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.5",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "2.0",
+    "y": "0.0"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.51",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "3.0",
+    "y": "0.040005334613699206"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.5",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "4.0",
+    "y": "0.0"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.51",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "5.0",
+    "y": "0.040005334613699206"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.52",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "6.0",
+    "y": "0.08004270767353656"
+  },
+  {
+    "forward_filled": true,
+    "p_tilde": "0.52",
+    "rejected_outlier": false,
+    "source": "forward_fill",
+    "trades_in_window": 0,
+    "ts_offset_sec": "7.0",
+    "y": "0.08004270767353656"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.53",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "8.0",
+    "y": "0.12014431184206341"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.54",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "9.0",
+    "y": "0.16034265007517948"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.55",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "10.0",
+    "y": "0.2006706954621514"
+  },
+  {
+    "forward_filled": false,
+    "p_tilde": "0.56",
+    "rejected_outlier": false,
+    "source": "book_mid",
+    "trades_in_window": 0,
+    "ts_offset_sec": "11.0",
+    "y": "0.24116205681688824"
+  }
+]

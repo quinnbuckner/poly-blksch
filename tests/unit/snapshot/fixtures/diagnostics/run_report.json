@@ -1,0 +1,14 @@
+{
+  "implied_variance": "0.131",
+  "ljung_box_lags": 10,
+  "ljung_box_pass": false,
+  "ljung_box_pvalue": "0.047761432463394995",
+  "ljung_box_statistic": "18.45467461339434",
+  "qq_quantile_correlation": "0.9976969361319921",
+  "qq_shapiro_wilk_pass": true,
+  "qq_shapiro_wilk_pvalue": "0.29226277048659316",
+  "realized_variance": "0.1234",
+  "variance_consistency_pass": true,
+  "variance_rel_error": "0.05801526717557259",
+  "variance_tolerance_pct": "0.2"
+}

@@ -1,0 +1,68 @@
+{
+  "fills_in_order": [
+    {
+      "fee_usd": "0.01",
+      "order_client_id": "c1",
+      "order_venue_id": "v1",
+      "price": "0.4",
+      "side": "buy",
+      "size": "10.0",
+      "token_id": "0xSNAPSHOT_TOK",
+      "ts": "2026-04-23T12:00:01Z"
+    },
+    {
+      "fee_usd": "0.01",
+      "order_client_id": "c2",
+      "order_venue_id": "v2",
+      "price": "0.5",
+      "side": "buy",
+      "size": "10.0",
+      "token_id": "0xSNAPSHOT_TOK",
+      "ts": "2026-04-23T12:00:02Z"
+    },
+    {
+      "fee_usd": "0.01",
+      "order_client_id": "c3",
+      "order_venue_id": "v3",
+      "price": "0.6",
+      "side": "sell",
+      "size": "5.0",
+      "token_id": "0xSNAPSHOT_TOK",
+      "ts": "2026-04-23T12:00:03Z"
+    },
+    {
+      "fee_usd": "0.01",
+      "order_client_id": "c4",
+      "order_venue_id": "v4",
+      "price": "0.55",
+      "side": "sell",
+      "size": "25.0",
+      "token_id": "0xSNAPSHOT_TOK",
+      "ts": "2026-04-23T12:00:04Z"
+    }
+  ],
+  "pnl_replayed": {
+    "fees_usd": "0.04",
+    "realized_usd": "2.21",
+    "unrealized_usd": "0.5000000000000004"
+  },
+  "pnl_stored": {
+    "fees_usd": "0.04",
+    "realized_usd": "2.2100000000000004",
+    "unrealized_usd": "0.5000000000000004"
+  },
+  "position": {
+    "avg_entry": "0.55",
+    "mark": "0.5",
+    "qty": "-10.0",
+    "realized_pnl_usd": "2.2100000000000004",
+    "token_id": "0xSNAPSHOT_TOK"
+  },
+  "reconcile_against_ledger": {
+    "discrepancies": [],
+    "passed": true,
+    "tokens_checked": [
+      "0xSNAPSHOT_TOK"
+    ]
+  }
+}

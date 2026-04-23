@@ -1,0 +1,78 @@
+{
+  "cancel_all_count": 2,
+  "final_resting_orders_count": 0,
+  "sync_1_initial": {
+    "ask": {
+      "client_id": "<redacted-cid>",
+      "created_ts": "<redacted-now>",
+      "price": "0.53",
+      "side": "sell",
+      "size": "10.0",
+      "status": "open",
+      "token_id": "0xSNAPSHOT_TOK",
+      "updated_ts": "<redacted-now>",
+      "venue_id": "paper-<redacted>"
+    },
+    "bid": {
+      "client_id": "<redacted-cid>",
+      "created_ts": "<redacted-now>",
+      "price": "0.47",
+      "side": "buy",
+      "size": "10.0",
+      "status": "open",
+      "token_id": "0xSNAPSHOT_TOK",
+      "updated_ts": "<redacted-now>",
+      "venue_id": "paper-<redacted>"
+    }
+  },
+  "sync_2_idempotent": {
+    "ask": {
+      "client_id": "<redacted-cid>",
+      "created_ts": "<redacted-now>",
+      "price": "0.53",
+      "side": "sell",
+      "size": "10.0",
+      "status": "open",
+      "token_id": "0xSNAPSHOT_TOK",
+      "updated_ts": "<redacted-now>",
+      "venue_id": "paper-<redacted>"
+    },
+    "bid": {
+      "client_id": "<redacted-cid>",
+      "created_ts": "<redacted-now>",
+      "price": "0.47",
+      "side": "buy",
+      "size": "10.0",
+      "status": "open",
+      "token_id": "0xSNAPSHOT_TOK",
+      "updated_ts": "<redacted-now>",
+      "venue_id": "paper-<redacted>"
+    }
+  },
+  "sync_2_reused_bid_cid": true,
+  "sync_3_price_change": {
+    "ask": {
+      "client_id": "<redacted-cid>",
+      "created_ts": "<redacted-now>",
+      "price": "0.54",
+      "side": "sell",
+      "size": "10.0",
+      "status": "open",
+      "token_id": "0xSNAPSHOT_TOK",
+      "updated_ts": "<redacted-now>",
+      "venue_id": "paper-<redacted>"
+    },
+    "bid": {
+      "client_id": "<redacted-cid>",
+      "created_ts": "<redacted-now>",
+      "price": "0.46",
+      "side": "buy",
+      "size": "10.0",
+      "status": "open",
+      "token_id": "0xSNAPSHOT_TOK",
+      "updated_ts": "<redacted-now>",
+      "venue_id": "paper-<redacted>"
+    }
+  },
+  "sync_3_replaced_bid_cid": true
+}
