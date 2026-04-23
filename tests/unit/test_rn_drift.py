@@ -14,6 +14,7 @@ from blksch.core.em.rn_drift import (
     DEFAULT_MU_CAP_PER_SEC,
     CalibrationResult,
     RNDriftConfig,
+    _warm_start_from_bipower,
     compile_mu_fn,
     em_calibrate,
 )
@@ -342,3 +343,74 @@ def test_mu_fn_exposes_grid_for_diagnostics() -> None:
     assert hasattr(mu_fn, "x_grid")
     assert hasattr(mu_fn, "mu_grid")
     assert len(mu_fn.x_grid) == len(mu_fn.mu_grid)  # type: ignore[attr-defined]
+
+
+# ---------- Bipower warm-start ----------
+
+
+def test_warm_start_recovers_sigma_b_via_bipower() -> None:
+    """On a pure-diffusion path, the BV warm-start should recover σ_b
+    within a few percent — BV/T ≈ σ_b² is the fundamental identity."""
+    rng = np.random.default_rng(3)
+    n = 4000
+    true_sigma_b = 0.07
+    dx = rng.normal(0.0, true_sigma_b, size=n - 1)
+    x = np.concatenate([[0.0], np.cumsum(dx)])
+    states = _states_from_path(x)
+    ws = _warm_start_from_bipower(states)
+    assert abs(ws.sigma_b - true_sigma_b) / true_sigma_b < 0.10, (
+        f"BV warm-start σ_b={ws.sigma_b:.4f} vs truth {true_sigma_b:.4f}"
+    )
+    assert ws.lambda_jump > 0, "λ_init should be a small positive seed, not zero"
+    assert ws.s_J > 0, "s_J_init should be non-zero so EM can identify jumps"
+
+
+def test_warm_start_handles_short_sequence() -> None:
+    ws = _warm_start_from_bipower([])
+    assert ws.sigma_b > 0
+    assert ws.s_J > 0
+    assert ws.lambda_jump > 0
+
+
+def test_em_calibrate_accepts_none_initial_params() -> None:
+    """``initial_params=None`` triggers the BV warm-start path."""
+    rng = np.random.default_rng(5)
+    n = 2000
+    x = np.cumsum(rng.normal(0.0, 0.05, size=n - 1))
+    states = _states_from_path(np.concatenate([[0.0], x]))
+
+    drift_cfg = RNDriftConfig(mc_samples=1000)
+    result = em_calibrate(states, initial_params=None, drift_config=drift_cfg)
+
+    # Recovered σ_b must be within a few percent of truth — warm-start +
+    # ≤50 iters should be enough on a pure-diffusion sample.
+    assert abs(result.final_params.sigma_b - 0.05) / 0.05 < 0.15
+    # s_J_sq_hat stays modest when there are no true jumps.
+    assert result.jumps.s_J_sq_hat < 0.01
+
+
+def test_warm_start_vs_misspecified_priors_land_within_10pct() -> None:
+    """BV warm-start and mis-specified priors should converge to compatible
+    final params on a modest JD path (both paths identifiable)."""
+    rng = np.random.default_rng(22)
+    true_sigma_b = 0.05
+    true_s_J = 0.5
+    true_lambda = 0.01
+    dx = rng.normal(0.0, true_sigma_b, size=5999)
+    jump_mask = rng.random(5999) < true_lambda
+    dx[jump_mask] += rng.normal(0.0, true_s_J, size=int(jump_mask.sum()))
+    x = np.concatenate([[0.0], np.cumsum(dx)])
+    states = _states_from_path(x)
+
+    cfg = RNDriftConfig(mc_samples=1500)
+    bv = em_calibrate(states, initial_params=None, drift_config=cfg, max_iters=30, tol=1e-5)
+    bad = em_calibrate(
+        states,
+        initial_params=MixtureParams(
+            sigma_b=true_sigma_b * 1.5, s_J=true_s_J * 0.5, lambda_jump=true_lambda * 2.0
+        ),
+        drift_config=cfg, max_iters=30, tol=1e-5,
+    )
+    # σ_b should be within 10 % between the two runs (both close to truth).
+    rel = abs(bv.final_params.sigma_b - bad.final_params.sigma_b) / true_sigma_b
+    assert rel < 0.10, f"σ_b diverges by {rel:.3f}"

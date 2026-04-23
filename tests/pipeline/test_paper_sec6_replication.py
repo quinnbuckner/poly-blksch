@@ -143,7 +143,7 @@ def _run_filter_stream(
 def _rolling_forecasts(
     states, *,
     window_sec: int, stride_sec: int, horizon_sec: int,
-    initial_params: MixtureParams, drift_cfg: RNDriftConfig,
+    initial_params: MixtureParams | None, drift_cfg: RNDriftConfig,
     max_iters: int = 12, tol: float = 1e-3,
 ) -> tuple[list[int], list[float], list[tuple[float, float, float]]]:
     """At each origin t (stride ``stride_sec``), fit EM on the last
@@ -216,21 +216,27 @@ def test_rn_jd_replicates_paper_table_1_causal_h60s(capsys) -> None:
         f"expected ~{cfg.n_steps} LogitStates; got {len(states)}"
     )
 
-    initial = MixtureParams(
-        sigma_b=cfg.sigma_b * 1.3,
-        s_J=cfg.jump_std * 1.3,
-        lambda_jump=cfg.lambda_per_sec * 1.5,
-        mu=0.0,
-    )
     drift_cfg = RNDriftConfig(
-        mc_samples=400,
+        mc_samples=2000,
         mu_cap_per_sec=cfg.mu_cap_per_sec,
         sprime_clip=cfg.sprime_clip,
     )
+    # Paper §6.4 recipe: 6 global EM steps to initialize, then rolling EM
+    # with 400 s windows. Each rolling fit resumes from the global params
+    # so short windows don't have to re-discover (σ_b, λ, s_J) from
+    # scratch — this is what breaks the 400 s identifiability ridge.
+    # em_calibrate(initial_params=None) auto-warm-starts from BV on the
+    # global window.
+    global_cal = em_calibrate(
+        states, initial_params=None,
+        max_iters=30, tol=1e-5,
+        drift_config=drift_cfg,
+    )
+    global_params = global_cal.final_params
     origins, preds, traj = _rolling_forecasts(
         states,
         window_sec=400, stride_sec=60, horizon_sec=60,
-        initial_params=initial, drift_cfg=drift_cfg,
+        initial_params=global_params, drift_cfg=drift_cfg,
         max_iters=12, tol=1e-3,
     )
     assert len(origins) > 50, f"expected >50 forecast origins, got {len(origins)}"

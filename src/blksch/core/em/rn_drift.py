@@ -56,7 +56,12 @@ from blksch.core.em.increments import (
     e_step,
     log_likelihood,
 )
-from blksch.core.em.jumps import JumpEstimate, m_step_jumps
+from blksch.core.em.jumps import (
+    DEFAULT_S_J_SQ_FLOOR,
+    JumpEstimate,
+    bipower_variance,
+    m_step_jumps,
+)
 from blksch.schemas import LogitState
 
 logger = logging.getLogger(__name__)
@@ -71,6 +76,14 @@ DEFAULT_SEED = 20260423
 
 DEFAULT_MAX_ITERS = 50
 DEFAULT_TOL = 1.0e-4
+
+# Warm-start heuristics when ``em_calibrate(initial_params=None)``.
+# Paper §5.2: bi-power variation is a jump-robust estimator of the integrated
+# diffusion variance. Seeding σ_b² with BV/T breaks the identifiability
+# degeneracy between (σ_b, λ, s_J²) — the mixture only has to sort out
+# (λ, s_J²).
+DEFAULT_WARM_START_LAMBDA = 0.01
+DEFAULT_WARM_START_S_J_SQ_FLOOR_MULT = 4.0  # s_J_init = sqrt(mult · s_J_sq_floor)
 
 
 MuFn = Callable[[datetime, float], float]
@@ -258,9 +271,71 @@ def _mean_state_mu(mu_fn: MuFn, states: list[LogitState]) -> float:
     return float(np.mean([mu_fn(s.ts, s.x_hat) for s in states]))
 
 
+def _warm_start_from_bipower(states: list[LogitState]) -> MixtureParams:
+    """Derive a self-consistent warm start from bi-power variation + RV.
+
+    Paper §5.2: BV is a jump-robust estimator of ``∫ σ_b²(s) ds`` — use it
+    to seed ``σ_b``. The residual ``RV - BV`` approximates the jump
+    contribution ``λ · s_J² · T`` (total quadratic variation minus the
+    diffusion piece), so given a neutral ``λ_init`` we can back out a
+    ``s_J_init`` that makes the seed self-consistent. This keeps EM from
+    collapsing into the "no jumps" local optimum when the data is weakly
+    informative about ``(λ, s_J)``.
+
+    Falls back to conservative scale-only seeds when the state sequence is
+    too short (< 3 increments).
+    """
+    if len(states) < 3:
+        return MixtureParams(
+            sigma_b=0.1,
+            s_J=0.3,
+            lambda_jump=DEFAULT_WARM_START_LAMBDA,
+            mu=0.0,
+        )
+
+    x = np.array([s.x_hat for s in states], dtype=float)
+    ts = [s.ts for s in states]
+    increments = np.diff(x)
+    dts = np.array(
+        [(ts[i + 1] - ts[i]).total_seconds() for i in range(len(ts) - 1)],
+        dtype=float,
+    )
+    total_time = float(np.sum(dts))
+    if total_time <= 0:
+        return MixtureParams(sigma_b=0.1, s_J=0.3, lambda_jump=DEFAULT_WARM_START_LAMBDA)
+
+    bv = bipower_variance(increments)
+    rv = float(np.sum(increments * increments))
+    sigma_b_sq_init = max(bv / total_time, 1.0e-8)
+    sigma_b_init = float(np.sqrt(sigma_b_sq_init))
+
+    # Excess quadratic variation above the diffusion component is attributed
+    # to jumps. Convert to a per-jump magnitude given λ_init.
+    excess = max(rv - bv, 0.0)
+    lambda_init = DEFAULT_WARM_START_LAMBDA
+    # Expected total jump events at λ_init; ensure at least ~1 so s_J_init
+    # has a meaningful scale on short windows.
+    effective_n_jumps = max(lambda_init * total_time, 1.0)
+    s_J_sq_init = max(
+        excess / effective_n_jumps,
+        DEFAULT_WARM_START_S_J_SQ_FLOOR_MULT * DEFAULT_S_J_SQ_FLOOR,
+    )
+    # Cap s_J_init so we don't seed pathologically wide (would wash out
+    # M-step signal); a few multiples of σ_b is a reasonable ceiling.
+    s_J_sq_init = min(s_J_sq_init, 100.0 * sigma_b_sq_init)
+    s_J_init = float(np.sqrt(s_J_sq_init))
+
+    return MixtureParams(
+        sigma_b=sigma_b_init,
+        s_J=s_J_init,
+        lambda_jump=lambda_init,
+        mu=0.0,
+    )
+
+
 def em_calibrate(
     states: list[LogitState],
-    initial_params: MixtureParams,
+    initial_params: MixtureParams | None = None,
     *,
     max_iters: int = DEFAULT_MAX_ITERS,
     tol: float = DEFAULT_TOL,
@@ -268,6 +343,21 @@ def em_calibrate(
     drift_config: RNDriftConfig | None = None,
 ) -> CalibrationResult:
     """Outer EM loop — E-step → M-steps → μ update, until LL converges.
+
+    Parameters
+    ----------
+    states
+        Filtered :class:`LogitState` history; adjacent pairs form the
+        increments driving the E-step.
+    initial_params
+        If ``None``, auto-warm-start σ_b from the bi-power variation of
+        ``Δx̂_t`` (paper §5.2 — jump-robust diffusion estimator) with
+        neutral seeds for ``λ``/``s_J``. This is the recommended default
+        because it breaks the (σ_b, λ, s_J²) identifiability degeneracy
+        that shows up in short (≤ 400 s) rolling windows with rare jumps.
+        Pass an explicit :class:`MixtureParams` when you want to bypass
+        warm-start (e.g. for sensitivity studies or to seed from a
+        previous calibration).
 
     Notes
     -----
@@ -288,6 +378,8 @@ def em_calibrate(
 
     cfg = drift_config or RNDriftConfig(mc_samples=jump_mc_samples)
 
+    if initial_params is None:
+        initial_params = _warm_start_from_bipower(states)
     params = initial_params
     mu_fn: MuFn = compile_mu_fn(
         params.sigma_b, params.lambda_jump, params.s_J, config=cfg
