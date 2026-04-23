@@ -117,13 +117,16 @@ class TestComputeQuote:
         return datetime(2026, 4, 22, 12, 0, 0, tzinfo=timezone.utc)
 
     def test_zero_inventory_symmetric_in_x(self) -> None:
+        # Short horizon so the natural spread does NOT saturate the
+        # [logit(eps), logit(1-eps)] clip — lets us check the post-fix
+        # symmetry about the reservation.
         q = compute_quote(
             token_id="tok",
             x_t=0.5,
             sigma_b=0.2,
-            time_to_horizon_sec=3600,
+            time_to_horizon_sec=60,
             inventory_q=0.0,
-            params=_params(),
+            params=_params(gamma=0.1),
             ts=self._ts(),
         )
         assert q.reservation_x == pytest.approx(0.5)
@@ -145,14 +148,17 @@ class TestComputeQuote:
         assert 0.0 < q.p_ask < 1.0
 
     def test_long_inventory_pulls_quote_down(self) -> None:
+        # Refresh-horizon regime: short T keeps both sides inside the
+        # [logit(eps), logit(1-eps)] clip so skew-shift is visible in x-space.
         ts = self._ts()
+        p = _params(gamma=0.1)
         q_flat = compute_quote(
-            token_id="t", x_t=0.0, sigma_b=0.3, time_to_horizon_sec=1000,
-            inventory_q=0.0, params=_params(), ts=ts,
+            token_id="t", x_t=0.0, sigma_b=0.1, time_to_horizon_sec=60,
+            inventory_q=0.0, params=p, ts=ts,
         )
         q_long = compute_quote(
-            token_id="t", x_t=0.0, sigma_b=0.3, time_to_horizon_sec=1000,
-            inventory_q=20.0, params=_params(), ts=ts,
+            token_id="t", x_t=0.0, sigma_b=0.1, time_to_horizon_sec=60,
+            inventory_q=20.0, params=p, ts=ts,
         )
         assert q_long.reservation_x < q_flat.reservation_x
         assert q_long.x_bid < q_flat.x_bid
@@ -160,25 +166,29 @@ class TestComputeQuote:
 
     def test_short_inventory_pulls_quote_up(self) -> None:
         ts = self._ts()
+        p = _params(gamma=0.1)
         q_short = compute_quote(
-            token_id="t", x_t=0.0, sigma_b=0.3, time_to_horizon_sec=1000,
-            inventory_q=-20.0, params=_params(), ts=ts,
+            token_id="t", x_t=0.0, sigma_b=0.1, time_to_horizon_sec=60,
+            inventory_q=-20.0, params=p, ts=ts,
         )
         q_flat = compute_quote(
-            token_id="t", x_t=0.0, sigma_b=0.3, time_to_horizon_sec=1000,
-            inventory_q=0.0, params=_params(), ts=ts,
+            token_id="t", x_t=0.0, sigma_b=0.1, time_to_horizon_sec=60,
+            inventory_q=0.0, params=p, ts=ts,
         )
         assert q_short.reservation_x > q_flat.reservation_x
 
     def test_widen_factor_widens_spread(self) -> None:
+        # Use a short horizon so the natural spread is well inside the
+        # [logit(eps), logit(1-eps)] clip — widening has room to grow.
         ts = self._ts()
+        p = _params(gamma=0.1)
         narrow = compute_quote(
-            token_id="t", x_t=0.0, sigma_b=0.3, time_to_horizon_sec=1000,
-            inventory_q=0.0, params=_params(), ts=ts, spread_widen_factor=1.0,
+            token_id="t", x_t=0.0, sigma_b=0.1, time_to_horizon_sec=60,
+            inventory_q=0.0, params=p, ts=ts, spread_widen_factor=1.0,
         )
         wide = compute_quote(
-            token_id="t", x_t=0.0, sigma_b=0.3, time_to_horizon_sec=1000,
-            inventory_q=0.0, params=_params(), ts=ts, spread_widen_factor=3.0,
+            token_id="t", x_t=0.0, sigma_b=0.1, time_to_horizon_sec=60,
+            inventory_q=0.0, params=p, ts=ts, spread_widen_factor=3.0,
         )
         assert wide.half_spread_x > narrow.half_spread_x
 
@@ -231,3 +241,105 @@ class TestComputeQuote:
         )
         assert p.eps <= q.p_bid <= 1.0 - p.eps
         assert p.eps <= q.p_ask <= 1.0 - p.eps
+
+
+# ---------------------------------------------------------------------------
+# Boundary-fix regression tests (track-b-quote-boundary-fix)
+# ---------------------------------------------------------------------------
+
+
+import logging as _logging
+
+from blksch.mm.greeks import logit as _logit
+
+
+class TestBoundaryFixRegressions:
+    """Regression tests for the two bugs fixed in track-b-quote-boundary-fix:
+      * BUG 1 — extreme-skew reservation blowup → one-sided quote fallback
+      * BUG 2 — boundary ε-shaving in `_apply_p_floor` → p-space solve with
+        clip as bisection invariant
+    """
+
+    def _ts(self) -> datetime:
+        return datetime(2026, 4, 23, 12, 0, 0, tzinfo=timezone.utc)
+
+    # -- BUG 1 regression ---------------------------------------------------
+
+    def test_one_sided_quote_when_reservation_extreme(self) -> None:
+        """Production regime γ=0.1, σ=0.35, T=3600, q=50 pushes r_x past
+        the logit boundary. The new behavior returns a one-sided Quote:
+        the pulled side sits at the ε boundary with size=0; the other side
+        sits at a sensible distance from x_t (strictly above p_bid by the
+        min-separation floor)."""
+        params = QuoteParams(gamma=0.1, k=1.5, eps=1e-5, delta_p_floor=0.01)
+        q_out = compute_quote(
+            token_id="tok", x_t=0.0, sigma_b=0.35, time_to_horizon_sec=3600.0,
+            inventory_q=50.0, params=params, ts=self._ts(),
+        )
+        # Long inventory ⇒ bid pulled to ε, size_bid zeroed for the router.
+        assert q_out.p_bid == pytest.approx(params.eps, abs=1e-12)
+        assert q_out.size_bid == 0.0
+        assert q_out.size_ask > 0.0
+        # Ask is at a sensible distance from x_t=0 (not collapsed to ε).
+        assert q_out.p_ask > q_out.p_bid + params.delta_p_floor
+        # x-space: bid pinned at logit(ε); ask above it.
+        assert q_out.x_bid == pytest.approx(_logit(params.eps), abs=1e-9)
+        assert q_out.x_ask > q_out.x_bid
+
+        # Symmetric short case — ask pulled to 1-ε.
+        q_short = compute_quote(
+            token_id="tok", x_t=0.0, sigma_b=0.35, time_to_horizon_sec=3600.0,
+            inventory_q=-50.0, params=params, ts=self._ts(),
+        )
+        assert q_short.p_ask == pytest.approx(1.0 - params.eps, abs=1e-12)
+        assert q_short.size_ask == 0.0
+        assert q_short.size_bid > 0.0
+
+    # -- BUG 2 regression ---------------------------------------------------
+
+    def test_delta_p_floor_exact_at_boundary(self) -> None:
+        """At p ∈ {ε, 1-ε} (the exact boundary values the δ_p floor bug
+        shaved ε off), displayed spread MUST be at least 2·delta_p_floor
+        — the clip is now a bisection invariant, not a post-clip patch."""
+        params = QuoteParams(gamma=0.1, k=1.5, eps=1e-5, delta_p_floor=0.01)
+        for p_target in (params.eps, 1.0 - params.eps):
+            x_t = _logit(p_target, eps=params.eps)
+            q_out = compute_quote(
+                token_id="tok", x_t=x_t, sigma_b=0.1, time_to_horizon_sec=60.0,
+                inventory_q=0.0, params=params, ts=self._ts(),
+            )
+            displayed = q_out.p_ask - q_out.p_bid
+            # Strict: 2·delta_p_floor exactly, no ε slack.
+            assert displayed >= 2.0 * params.delta_p_floor, (
+                f"δ_p floor shaved at p={p_target}: displayed={displayed}"
+            )
+
+    # -- Structured logging regression --------------------------------------
+
+    def test_one_sided_quote_logs_structured_event(self, caplog) -> None:
+        """The one-sided fallback logs a structured warning the dashboard
+        picks up. Event key `quote_one_sided` with `token_id`, `reason`,
+        `q`, `r_x`, `pulled_side`."""
+        params = QuoteParams(gamma=0.1, k=1.5, eps=1e-5, delta_p_floor=0.01)
+        with caplog.at_level(_logging.WARNING, logger="blksch.mm.quote"):
+            compute_quote(
+                token_id="0xABC", x_t=0.0, sigma_b=0.35, time_to_horizon_sec=3600.0,
+                inventory_q=50.0, params=params, ts=self._ts(),
+            )
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno == _logging.WARNING
+            and getattr(r, "event", None) == "quote_one_sided"
+        ]
+        assert matching, (
+            f"expected a warning with event='quote_one_sided'; got records: "
+            f"{[(r.levelname, r.message, r.__dict__.get('event')) for r in caplog.records]}"
+        )
+        record = matching[0]
+        assert record.__dict__.get("token_id") == "0xABC"
+        assert record.__dict__.get("reason") == "extreme_skew_reservation"
+        assert record.__dict__.get("pulled_side") == "bid"
+        assert record.__dict__.get("q") == 50.0
+        # r_x reported faithfully (pre-clip, the paper's eq (8) value).
+        assert record.__dict__.get("r_x") is not None

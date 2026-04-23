@@ -132,22 +132,6 @@ def _quote_inputs(draw):
     return x_t, sigma_b, T, q, gamma, k
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Window B (mm/quote.py): at moderate-to-high inventory × long horizon, "
-        "the §4.2 reservation r_x = x_t - q·γ·σ²·(T-t) is driven past the "
-        "unit-interval boundary; the p-floor bisector caps δ at 40 logit units "
-        "but both sides then sigmoid to ~0 and the final eps clamp collapses "
-        "them to p_bid == p_ask == eps. Reproducer: x_t=0.0, σ_b=0.5, T=6s, "
-        "q=69, γ=0.5, k=1.0 → Quote(p_bid=1e-5, p_ask=1e-5). This is below the "
-        "computed q_max=200 at x_t=0 but above the effective q_max at the "
-        "boundary-adjusted reservation. Owning window: B. Suggested fix "
-        "surface: tighten inventory cap against the *reservation-local* S'(x) "
-        "rather than x_t's, or short-circuit to a one-sided quote when the "
-        "two-sided clamp degenerates."
-    ),
-)
 @FUZZ
 @given(_quote_inputs())
 def test_quote_is_proper_two_sided(inp):

@@ -73,9 +73,34 @@ def _position(qty: float = 0.0) -> Position:
 
 
 class TestExpectedQuoteOnFixedInputs:
-    def test_exact_numbers(self) -> None:
-        """With fixed γ=0.5, σ=0.3, (T-t)=1000, k=1.5, q=10, x_t=0.0,
-        the paper's eq (8-9) give specific numbers we pin down."""
+    def test_exact_paper_formulas_at_realistic_params(self) -> None:
+        """Realistic refresh-horizon regime (γ=0.1, σ=0.1, T=60, q=10):
+        the paper's eq (8-9) produce specific numbers and the clip does
+        not bind, so the Quote preserves them in both reservation and
+        x_bid / x_ask."""
+        gamma, sigma, tau, k, q = 0.1, 0.1, 60.0, 1.5, 10.0
+        params = QuoteParams(gamma=gamma, k=k, delta_p_floor=0.0)
+
+        q_out = compute_quote(
+            token_id=TOK, x_t=0.0, sigma_b=sigma, time_to_horizon_sec=tau,
+            inventory_q=q, params=params, ts=_ts(0),
+        )
+
+        r_expected = 0.0 - q * gamma * sigma * sigma * tau  # = -0.6
+        assert q_out.reservation_x == pytest.approx(r_expected)
+
+        delta_expected = 0.5 * (gamma * sigma * sigma * tau + (2.0 / k) * math.log1p(gamma / k))
+        # Note half_spread_x here reflects the actual posted logit spread;
+        # at realistic params the natural δ is well inside the boundary clip.
+        assert q_out.x_bid == pytest.approx(r_expected - delta_expected, rel=1e-9)
+        assert q_out.x_ask == pytest.approx(r_expected + delta_expected, rel=1e-9)
+        assert q_out.half_spread_x == pytest.approx(delta_expected, rel=1e-9)
+
+    def test_extreme_skew_triggers_one_sided_quote(self) -> None:
+        """Extreme-skew regime (γ=0.5, σ=0.3, T=1000, q=10): the paper's
+        r_x and δ_x formulas are still reported truthfully, but the quote
+        is one-sided — pulled bid at eps, size_bid=0, size_ask>0 — because
+        a two-sided quote would collapse both sides to the boundary."""
         gamma, sigma, tau, k, q = 0.5, 0.3, 1000.0, 1.5, 10.0
         params = QuoteParams(gamma=gamma, k=k, delta_p_floor=0.0)
 
@@ -84,21 +109,15 @@ class TestExpectedQuoteOnFixedInputs:
             inventory_q=q, params=params, ts=_ts(0),
         )
 
-        # Reservation: r = 0 - 10·0.5·0.09·1000 = -450
-        r_expected = 0.0 - q * gamma * sigma * sigma * tau
+        # Paper formulas unchanged — reservation is still the §4.2 value.
+        r_expected = 0.0 - q * gamma * sigma * sigma * tau  # -450
         assert q_out.reservation_x == pytest.approx(r_expected)
 
-        # Half spread: δ = ½[0.5·0.09·1000 + (2/1.5)·log(1+0.5/1.5)]
-        delta_expected = 0.5 * (gamma * sigma * sigma * tau + (2.0 / k) * math.log1p(gamma / k))
-        assert q_out.half_spread_x == pytest.approx(delta_expected, rel=1e-9)
-
-        assert q_out.x_bid == pytest.approx(r_expected - delta_expected)
-        assert q_out.x_ask == pytest.approx(r_expected + delta_expected)
-
-        # With such a large skew (r=-450, δ≈22.5), x_ask is still deep negative;
-        # p_ask will sit near the eps floor.
-        params_eps = params.eps
-        assert q_out.p_bid == pytest.approx(params_eps, rel=1e-6)
+        # One-sided: bid pinned to eps, ask at a sensible distance.
+        assert q_out.p_bid == pytest.approx(params.eps, rel=1e-6)
+        assert q_out.size_bid == 0.0
+        assert q_out.size_ask > 0.0
+        assert q_out.p_ask > q_out.p_bid
 
 
 # ---------------------------------------------------------------------------
@@ -246,14 +265,16 @@ class TestRefreshLoop:
     @pytest.mark.asyncio
     async def test_news_widen_does_not_pull(self) -> None:
         collector = _Collector()
+        # Short horizon + small σ so the widen factor has room to grow the
+        # half-spread without saturating the [logit(eps), logit(1-eps)] clip.
         snap = MarketSnapshot(
             token_id=TOK,
             logit_state=_logit(0.0, sec=0.0),
-            surface=_surface(0.3, sec=0.0),
+            surface=_surface(0.1, sec=0.0),
             position=_position(0.0),
             book=_book(0.5, sec=0.0),
             trades=(),
-            time_to_horizon_sec=1000.0,
+            time_to_horizon_sec=60.0,
         )
         clock = lambda: _ts(50)  # inside news pre-buffer below
         loop = RefreshLoop(

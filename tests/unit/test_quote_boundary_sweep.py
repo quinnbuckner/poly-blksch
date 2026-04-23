@@ -55,10 +55,8 @@ INVENTORY_SWEEP = (-Q_MAX_SCALAR, -Q_MAX_SCALAR / 2.0, 0.0, Q_MAX_SCALAR / 2.0, 
 MAIN_SIGMA_B = 0.1
 MAIN_T_SEC = 60.0
 
-# The δ_p floor bug triggers only when p is within eps (=1e-5) of the {0, 1}
-# clip, i.e., the 4 extreme endpoints of SWEEP_P. Interior p passes strict.
-_NEAR_BOUNDARY_P = (1e-5, 5e-5, 1e-4, 0.99999)
-_INTERIOR_P = tuple(p for p in SWEEP_P if p not in _NEAR_BOUNDARY_P)
+# Post-boundary-fix: all p values pass the strict floor check.
+_ALL_P = SWEEP_P
 
 
 def _finite(x: float) -> bool:
@@ -162,53 +160,23 @@ class TestQuoteBoundarySweep:
         )
         assert quote.reservation_x == pytest.approx(x_t, abs=1e-9)
 
-    @pytest.mark.parametrize("p", _INTERIOR_P)
-    def test_p_spread_floors_at_or_above_delta_p_floor_interior(self, p: float) -> None:
-        """δ_p = p_ask - p_bid ≥ 2 · delta_p_floor for p comfortably inside
-        [ε, 1-ε]. The floor dominates as p → 0 or 1 where S'(x) → 0 would
-        otherwise auto-compress δ_p to zero."""
+    @pytest.mark.parametrize("p", _ALL_P)
+    def test_p_spread_floors_at_or_above_delta_p_floor(self, p: float) -> None:
+        """δ_p = p_ask - p_bid ≥ 2 · delta_p_floor across the full (0,1) sweep
+        — including p within ε of the {0, 1} boundary. The post-fix
+        `_apply_p_floor` solves directly in p-space with the unit-interval
+        clip as a bisection invariant, so the cramped side widens
+        asymmetrically when the other is pinned."""
         x_t = logit(p)
         quote = compute_quote(
             token_id=TOK, x_t=x_t, sigma_b=MAIN_SIGMA_B, time_to_horizon_sec=MAIN_T_SEC,
             inventory_q=0.0, params=DEFAULT_PARAMS, ts=TS,
         )
         displayed = quote.p_ask - quote.p_bid
-        assert displayed >= 2.0 * DEFAULT_PARAMS.delta_p_floor - 1e-9, (
+        # Strict: no ε slack (only float-rounding tolerance).
+        assert displayed >= 2.0 * DEFAULT_PARAMS.delta_p_floor - 1e-12, (
             f"δ_p floor violated at p={p}: displayed={displayed}"
         )
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "mm/quote.py boundary floor — known fix scope. When p is within "
-            "`eps` of the {0, 1} boundary, the final sigmoid clip to [eps, 1-eps] "
-            "in compute_quote bites into the upper (or lower) half of the "
-            "2·delta_p_floor spread the bisection just widened to, leaving "
-            "displayed δ_p a few ε short of 2·delta_p_floor. Minimal reproducer: "
-            "p=1-1e-5, σ_b=0.1, T=60, q=0, delta_p_floor=0.01 ⇒ displayed "
-            "= 0.01999 (short by 1e-5 = ε). Fix scope: in _apply_p_floor, "
-            "either (a) budget δ against the logit(eps), logit(1-eps) clip "
-            "by expanding further on the cramped side, or (b) skip the final "
-            "eps clip when the bisection has already widened past the floor."
-        ),
-    )
-    @pytest.mark.parametrize("p", _NEAR_BOUNDARY_P)
-    def test_p_spread_floor_near_boundary_xfail(self, p: float) -> None:
-        """Near-boundary p — currently fails strict floor by up to ε.
-
-        This is a real numerical correctness bug in mm/quote.py's
-        `_apply_p_floor` + final clip interaction. Does not affect paper-
-        soak PnL because the bot pulls quotes via inventory/limits before
-        reaching p within ε of the boundary in practice, but should be
-        fixed before Stage-2 live."""
-        x_t = logit(p)
-        quote = compute_quote(
-            token_id=TOK, x_t=x_t, sigma_b=MAIN_SIGMA_B, time_to_horizon_sec=MAIN_T_SEC,
-            inventory_q=0.0, params=DEFAULT_PARAMS, ts=TS,
-        )
-        displayed = quote.p_ask - quote.p_bid
-        # Strict: no eps slack.
-        assert displayed >= 2.0 * DEFAULT_PARAMS.delta_p_floor
 
 
 # ---------------------------------------------------------------------------
