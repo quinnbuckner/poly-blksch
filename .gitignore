@@ -23,6 +23,9 @@ data/
 *.sqlite
 *.sqlite3
 
+# Test-run artifacts (e.g. gate-sweep-<ts>.json from the §6 replication gate)
+runs/
+
 # OS / editor
 .DS_Store
 .idea/
