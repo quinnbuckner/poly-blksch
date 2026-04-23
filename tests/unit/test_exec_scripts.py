@@ -81,3 +81,31 @@ def test_signing_canary_dry_run_prints_plan(monkeypatch, caplog):
     assert rc == 0
     assert "Dry-run" in caplog.text
     assert "--i-mean-it" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# record_contract_fixtures
+# ---------------------------------------------------------------------------
+
+
+def test_record_contract_fixtures_help_works():
+    mod = _import_script("record_contract_fixtures")
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["--help"])
+    assert exc.value.code == 0
+
+
+def test_record_contract_fixtures_dry_run_is_offline(caplog):
+    """Dry-run must print the plan and exit 0 without any HTTP / WS
+    activity — operators shouldn't be able to accidentally hit the
+    network just by running the script with no flags."""
+    mod = _import_script("record_contract_fixtures")
+    caplog.set_level(logging.WARNING)
+    rc = mod.main([])
+    assert rc == 0
+    text = caplog.text
+    assert "Dry-run" in text
+    assert "gamma-api.polymarket.com/markets" in text
+    assert "clob.polymarket.com/book" in text
+    assert "ws-subscriptions-clob.polymarket.com" in text
+    assert "--i-mean-it" in text
