@@ -1,58 +1,417 @@
-"""Unit tests for `core/filter/kalman.py` (paper §5.1).
-
-Heteroskedastic Kalman (or UKF near boundaries) on y = logit(p~) with
-time-varying measurement variance sigma_eta^2(t). The transition model is a
-local level; the RN drift is injected later by the EM loop.
-"""
+"""Unit tests for ``core/filter/kalman.KalmanFilter`` (paper §5.1)."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
 import numpy as np
 import pytest
+from scipy import stats
 
-kalman = pytest.importorskip(
-    "blksch.core.filter.kalman",
-    reason="core/filter/kalman.py not yet implemented",
+from blksch.core.filter.canonical_mid import CanonicalMid
+from blksch.core.filter.kalman import (
+    DEFAULT_BOUNDARY_P_HIGH,
+    DEFAULT_BOUNDARY_P_LOW,
+    KalmanFilter,
+    _sigmoid,
 )
+from blksch.schemas import BookSnap, PriceLevel
 
 pytestmark = pytest.mark.unit
 
 
-class TestKalmanOnSyntheticPath:
-    def test_recovers_true_x_on_diffusion_only(self) -> None:
-        """With jumps disabled, mean squared error of (x_hat - x_true) should be
-        ~ sigma_eta^2 / (effective observation count), i.e. small."""
-        from tests.fixtures.synthetic import (
-            SyntheticConfig,
-            generate_rn_consistent_path,
-            inject_microstructure_noise,
-        )
+# ---------- Helpers ----------
 
-        cfg = SyntheticConfig(lambda_per_sec=0.0, sched_jump_lambda_boost=0.0, n_steps=2000)
-        path = generate_rn_consistent_path(cfg)
-        y, sigma_eta2 = inject_microstructure_noise(path.x)
 
-        # Expected API - adapt to actual module signature:
-        filt = kalman.HeteroskedasticKalman()  # type: ignore[attr-defined]
-        x_hat = filt.filter(y, sigma_eta2)  # type: ignore[attr-defined]
+@dataclass
+class ConstantMicrostruct:
+    """Fixed σ_η² for every call — decouples KF tests from eq (10) fit."""
 
-        mse = float(np.mean((x_hat - path.x) ** 2))
-        assert mse < 0.02, f"KF MSE too high: {mse:.4f} — filter is not tracking"
+    sigma_eta2: float
 
-    def test_handles_heteroskedastic_noise_gracefully(self) -> None:
-        """When sigma_eta^2(t) swings 10x between regimes, filter should
-        down-weight high-noise periods — MSE no worse than 2x baseline."""
-        pytest.skip("Stub: implement after baseline test passes")
+    def variance(self, book, trades=(), *, forward_filled: bool = False) -> float:
+        return self.sigma_eta2
 
-    def test_smoother_beats_filter_on_past_points(self) -> None:
-        """RTS smoother should reduce MSE vs. forward-only filter on indices < N-h."""
-        pytest.skip("Stub")
 
-    def test_ukf_fallback_near_boundaries(self) -> None:
-        """With p pinned near 0.01 for long stretches, UKF variant should not
-        diverge even though KF may be unstable."""
-        pytest.skip("Stub")
+@dataclass
+class ScheduledMicrostruct:
+    """Returns a sequence of variances in order — for regime / divergence drills."""
 
-    def test_innovations_are_serially_uncorrelated(self) -> None:
-        """Ljung-Box on one-step-ahead innovations must not reject at 5%."""
-        pytest.skip("Stub: depends on diagnostics module")
+    variances: list[float]
+    _i: int = 0
+
+    def variance(self, book, trades=(), *, forward_filled: bool = False) -> float:
+        if self._i >= len(self.variances):
+            return self.variances[-1]
+        v = self.variances[self._i]
+        self._i += 1
+        return v
+
+
+def _book(p: float) -> BookSnap:
+    """Minimal dummy book — content doesn't matter for the Constant oracle."""
+    p = max(1e-5, min(1 - 1e-5, p))
+    return BookSnap(
+        token_id="t",
+        bids=[PriceLevel(price=max(0.0, p - 0.01), size=1000)],
+        asks=[PriceLevel(price=min(1.0, p + 0.01), size=1000)],
+        ts=datetime.now(UTC),
+    )
+
+
+def _cm(ts: datetime, y: float, *, forward_filled: bool = False) -> CanonicalMid:
+    p = max(1e-5, min(1 - 1e-5, _sigmoid(y)))
+    return CanonicalMid(
+        token_id="t",
+        ts=ts,
+        p_tilde=p,
+        y=y,
+        forward_filled=forward_filled,
+        rejected_outlier=False,
+        trades_in_window=0,
+        source="book_mid",
+    )
+
+
+def _ljung_box_pvalue(residuals: np.ndarray, lags: int) -> float:
+    """Manual Ljung–Box (statsmodels not in the project deps).
+
+    Q = n(n+2) Σ_{k=1}^{lags} ρ̂_k² / (n - k),  Q ~ χ²(lags) under H₀.
+    Returns the right-tail p-value.
+    """
+    n = residuals.size
+    x = residuals - residuals.mean()
+    var = np.dot(x, x)
+    if var <= 0:
+        return 1.0
+    q = 0.0
+    for k in range(1, lags + 1):
+        rho = np.dot(x[:-k], x[k:]) / var
+        q += rho * rho / (n - k)
+    q *= n * (n + 2)
+    return float(stats.chi2.sf(q, df=lags))
+
+
+# ---------- Constructor validation ----------
+
+
+def test_rejects_negative_sigma_b() -> None:
+    with pytest.raises(ValueError):
+        KalmanFilter(token_id="t", microstruct=ConstantMicrostruct(0.01), sigma_b=-0.1)
+
+
+def test_rejects_non_positive_initial_variance() -> None:
+    with pytest.raises(ValueError):
+        KalmanFilter(token_id="t", microstruct=ConstantMicrostruct(0.01), initial_variance=0)
+
+
+def test_rejects_bad_boundary_thresholds() -> None:
+    with pytest.raises(ValueError):
+        KalmanFilter(token_id="t", microstruct=ConstantMicrostruct(0.01), boundary_p_low=0.6)
+    with pytest.raises(ValueError):
+        KalmanFilter(token_id="t", microstruct=ConstantMicrostruct(0.01), boundary_p_high=0.4)
+
+
+# ---------- Synthetic-path recovery ----------
+
+
+def _simulate_random_walk(
+    rng: np.random.Generator,
+    *,
+    n: int,
+    sigma_b: float,
+    sigma_eta: float,
+    dt: float = 1.0,
+    x0: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    x_true = np.empty(n)
+    x_true[0] = x0
+    for t in range(1, n):
+        x_true[t] = x_true[t - 1] + rng.normal(0.0, sigma_b * np.sqrt(dt))
+    y_obs = x_true + rng.normal(0.0, sigma_eta, size=n)
+    return x_true, y_obs
+
+
+def test_recovery_within_3_sigma_on_95pct_of_steps() -> None:
+    rng = np.random.default_rng(2026)
+    n = 2000
+    sigma_b = 0.2
+    sigma_eta = 0.15
+    x_true, y_obs = _simulate_random_walk(rng, n=n, sigma_b=sigma_b, sigma_eta=sigma_eta)
+
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(sigma_eta * sigma_eta),
+        sigma_b=sigma_b,
+    )
+    t0 = datetime(2026, 4, 23, 7, 0, 0, tzinfo=UTC)
+    within = 0
+    # Skip the first few ticks where the posterior is still warming up.
+    warmup = 5
+    counted = 0
+    for t in range(n):
+        ts = t0 + timedelta(seconds=t)
+        state = kf.step(_cm(ts, y_obs[t]), _book(_sigmoid(y_obs[t])))
+        if t < warmup:
+            continue
+        counted += 1
+        sigma_total = float(np.sqrt(kf.posterior_variance + state.sigma_eta2))
+        if abs(state.x_hat - x_true[t]) < 3.0 * sigma_total:
+            within += 1
+    assert within / counted >= 0.95, f"only {within}/{counted} within 3σ"
+
+
+def test_recovery_mse_small_vs_noise() -> None:
+    rng = np.random.default_rng(7)
+    n = 1500
+    sigma_b = 0.1
+    sigma_eta = 0.2
+    x_true, y_obs = _simulate_random_walk(rng, n=n, sigma_b=sigma_b, sigma_eta=sigma_eta)
+
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(sigma_eta * sigma_eta),
+        sigma_b=sigma_b,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    x_hat = np.empty(n)
+    for t in range(n):
+        ts = t0 + timedelta(seconds=t)
+        state = kf.step(_cm(ts, y_obs[t]), _book(_sigmoid(y_obs[t])))
+        x_hat[t] = state.x_hat
+
+    # KF should beat the raw observations by a healthy margin.
+    mse_kf = float(np.mean((x_hat[50:] - x_true[50:]) ** 2))
+    mse_raw = float(np.mean((y_obs[50:] - x_true[50:]) ** 2))
+    assert mse_kf < 0.5 * mse_raw, f"KF MSE={mse_kf:.4f} did not beat raw MSE={mse_raw:.4f}"
+
+
+# ---------- Innovation whitening ----------
+
+
+def test_innovations_pass_ljung_box() -> None:
+    """Normalized one-step innovations are white under correct σ_η² calibration.
+
+    We keep the simulated path well away from the logit boundary (small
+    sigma_b × sqrt(n) keeps |x| < 4 in practice), so the UKF augmentation
+    stays inactive and the KF operates in its linear regime.
+    """
+    rng = np.random.default_rng(11)
+    n = 3000
+    sigma_b = 0.03
+    sigma_eta = 0.1
+    x_true, y_obs = _simulate_random_walk(rng, n=n, sigma_b=sigma_b, sigma_eta=sigma_eta)
+
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(sigma_eta * sigma_eta),
+        sigma_b=sigma_b,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    normed = []
+    for t in range(n):
+        ts = t0 + timedelta(seconds=t)
+        kf.step(_cm(ts, y_obs[t]), _book(_sigmoid(y_obs[t])))
+        if kf.last_innovation is None or kf.last_innovation_variance is None:
+            continue
+        if t == 0:
+            continue
+        normed.append(kf.last_innovation / np.sqrt(kf.last_innovation_variance))
+
+    normed_arr = np.array(normed[100:])  # warmup
+    p_value = _ljung_box_pvalue(normed_arr, lags=20)
+    assert p_value > 0.05, f"Ljung–Box rejected whiteness (p={p_value:.3f})"
+
+
+# ---------- UKF / KF handoff smoothness ----------
+
+
+def test_no_discontinuity_at_boundary_sweep() -> None:
+    """Drive p smoothly across the p_low=0.02 boundary and back.
+
+    With fine steps in p, consecutive posterior means x̂ should not jump by
+    more than ~1σ (the natural scale of a single innovation); the UKF blend
+    weight is continuous in p so there is no step at p=0.02.
+    """
+    sigma_eta = 0.05
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(sigma_eta * sigma_eta),
+        sigma_b=0.05,
+        boundary_p_low=DEFAULT_BOUNDARY_P_LOW,
+        boundary_p_high=DEFAULT_BOUNDARY_P_HIGH,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+
+    # Smooth sweep of p values: interior → through 0.02 → deeper into boundary → back out.
+    p_path = np.concatenate([
+        np.linspace(0.05, 0.012, 200),
+        np.linspace(0.012, 0.05, 200),
+    ])
+    y_path = np.log(p_path / (1.0 - p_path))
+
+    # Burn in so the posterior stabilizes before we hit the boundary.
+    for i in range(30):
+        kf.step(_cm(t0 + timedelta(seconds=i), float(y_path[0])), _book(float(p_path[0])))
+    prev_x = kf.x_hat
+    jumps = []
+    for i, y in enumerate(y_path):
+        ts = t0 + timedelta(seconds=30 + i)
+        state = kf.step(_cm(ts, float(y)), _book(float(p_path[i])))
+        sigma = float(np.sqrt(kf.posterior_variance + state.sigma_eta2))
+        jumps.append(abs(state.x_hat - prev_x) / sigma)
+        prev_x = state.x_hat
+    assert max(jumps) < 1.0, f"max step jump was {max(jumps):.3f} σ"
+
+
+def test_handoff_blend_weight_is_continuous_at_p_low() -> None:
+    """Probe the blend weight at adjacent p values straddling p_low; the
+    internal R_effective must not step (< ~2% relative jump for a small p move).
+    """
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(0.01),
+        sigma_b=0.05,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    # Warm up at p=0.5.
+    kf.step(_cm(t0, 0.0), _book(0.5))
+    # Step 1: p just above p_low (0.021).
+    kf.step(_cm(t0 + timedelta(seconds=1), float(np.log(0.021 / 0.979))), _book(0.021))
+    r_just_outside = kf.last_R_effective
+    # Step 2: p just below p_low (0.019).
+    kf.step(_cm(t0 + timedelta(seconds=2), float(np.log(0.019 / 0.981))), _book(0.019))
+    r_just_inside = kf.last_R_effective
+    # Both should be close — the blend weight moved only a little.
+    assert r_just_outside is not None and r_just_inside is not None
+    rel = abs(r_just_inside - r_just_outside) / max(r_just_outside, 1e-12)
+    assert rel < 0.05, f"R jumped {rel:.3f} across the p_low boundary"
+
+
+def test_far_from_boundary_matches_linear_kf() -> None:
+    """In the interior (p ∈ (p_low, p_high)), R_effective equals R_raw."""
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(0.01),
+        sigma_b=0.1,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    kf.step(_cm(t0, 0.0), _book(0.5))  # initialize at p=0.5
+    kf.step(_cm(t0 + timedelta(seconds=1), 0.1), _book(0.52))
+    assert kf.last_R_effective == pytest.approx(0.01)
+
+
+# ---------- Divergence protection ----------
+
+
+def test_divergence_under_pathological_variance() -> None:
+    """Alternate σ_η² between 1e-12 and 1e12 each step — KF must stay bounded."""
+    variances = []
+    for _ in range(100):
+        variances.extend([1e-12, 1e12])
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ScheduledMicrostruct(variances=variances),
+        sigma_b=0.1,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    for i in range(200):
+        ts = t0 + timedelta(seconds=i)
+        state = kf.step(_cm(ts, 0.0), _book(0.5))
+        assert abs(state.x_hat) < 100.0, f"x̂ blew up to {state.x_hat} at step {i}"
+        assert np.isfinite(kf.posterior_variance)
+        assert 0.0 <= (kf.last_K or 0.0) <= 1.0
+
+
+def test_gain_clipped_to_unit_interval() -> None:
+    """Even with P_pred >> R (extreme case), gain stays ≤ 1."""
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(1e-12),
+        sigma_b=10.0,  # huge process noise → P_pred grows fast
+        initial_variance=1000.0,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    for i in range(10):
+        ts = t0 + timedelta(seconds=i)
+        kf.step(_cm(ts, 0.5), _book(0.6))
+        if kf.last_K is not None:
+            assert 0.0 <= kf.last_K <= 1.0
+
+
+# ---------- LogitState shape ----------
+
+
+def test_emits_logit_state_with_microstruct_variance() -> None:
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(0.05),
+        sigma_b=0.1,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    state = kf.step(_cm(t0, 0.25), _book(0.56))
+    assert state.token_id == "t"
+    assert state.ts == t0
+    assert state.sigma_eta2 == pytest.approx(0.05)
+    assert state.x_hat == pytest.approx(0.25)  # anchored to obs on first tick
+
+
+def test_surfaces_raw_microstruct_variance_even_near_boundary() -> None:
+    """Inflation inside _effective_R is an internal knob; the published
+    sigma_eta2 stays faithful to MicrostructModel.variance output."""
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(0.04),
+        sigma_b=0.1,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    # Initialize first.
+    kf.step(_cm(t0, 0.0), _book(0.5))
+    state = kf.step(_cm(t0 + timedelta(seconds=1), 4.0), _book(0.98))  # near boundary
+    assert state.sigma_eta2 == pytest.approx(0.04)
+    # The internal effective R should be ≥ raw.
+    assert kf.last_R_effective >= 0.04
+
+
+# ---------- Forward-fill passthrough ----------
+
+
+@dataclass
+class FFMicrostruct:
+    base: float
+    factor: float
+    last_ff: bool = False
+
+    def variance(self, book, trades=(), *, forward_filled: bool = False) -> float:
+        self.last_ff = forward_filled
+        return self.base * (self.factor if forward_filled else 1.0)
+
+
+def test_forward_filled_flag_passed_to_microstruct() -> None:
+    m = FFMicrostruct(base=0.01, factor=10.0)
+    kf = KalmanFilter(token_id="t", microstruct=m, sigma_b=0.1)
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    kf.step(_cm(t0, 0.0), _book(0.5))  # fresh
+    assert m.last_ff is False
+    kf.step(_cm(t0 + timedelta(seconds=1), 0.0, forward_filled=True), _book(0.5))
+    assert m.last_ff is True
+
+
+# ---------- dt handling ----------
+
+
+def test_long_gap_is_capped() -> None:
+    """A long gap between ticks should not drive P_pred to infinity."""
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(0.01),
+        sigma_b=0.5,
+        max_dt_sec=60.0,
+    )
+    t0 = datetime(2026, 4, 23, tzinfo=UTC)
+    kf.step(_cm(t0, 0.0), _book(0.5))
+    # 1 hour gap — would be Q = σ_b²·3600 = 900 without cap. With cap: 15.
+    kf.step(_cm(t0 + timedelta(hours=1), 0.0), _book(0.5))
+    # Posterior variance stays comparable to capped predict + innovation.
+    assert kf.posterior_variance < 30.0
