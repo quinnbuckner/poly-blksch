@@ -35,8 +35,26 @@ from blksch.schemas import BookSnap, Order, OrderSide, OrderStatus, PriceLevel
 log = logging.getLogger(__name__)
 
 POLY_CLOB_BASE = "https://clob.polymarket.com"
-POLY_CHAIN_ID_MAINNET = 137  # Polygon
-POLY_CHAIN_ID_AMOY = 80002  # Polygon testnet
+POLY_CLOB_BASE_TESTNET = "https://clob-staging.polymarket.com"
+POLY_CHAIN_ID_MAINNET = 137  # Polygon PoS mainnet
+POLY_CHAIN_ID_AMOY = 80002   # Polygon PoS Amoy testnet (Mumbai was deprecated 2024-04)
+
+Network = Literal["mainnet", "testnet"]
+
+
+def _network_from_chain_id(chain_id: int) -> Network:
+    if chain_id == POLY_CHAIN_ID_MAINNET:
+        return "mainnet"
+    if chain_id == POLY_CHAIN_ID_AMOY:
+        return "testnet"
+    raise ValueError(
+        f"Unsupported chain_id {chain_id}; expected {POLY_CHAIN_ID_MAINNET} (mainnet) "
+        f"or {POLY_CHAIN_ID_AMOY} (amoy testnet)."
+    )
+
+
+def _default_base_url(network: Network) -> str:
+    return POLY_CLOB_BASE if network == "mainnet" else POLY_CLOB_BASE_TESTNET
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +66,11 @@ POLY_CHAIN_ID_AMOY = 80002  # Polygon testnet
 class CLOBConfig:
     """Connection config. ``private_key`` and api creds are required only for
     signed endpoints (order placement, cancellation). Read-only usage can pass
-    None for all credentials."""
+    None for all credentials.
+
+    ``network`` / ``chain_id`` / ``base_url`` / ``verifying_contract`` move
+    together. Use :meth:`for_network` to pick a consistent default triple and
+    then override individual fields (env vars, CLI flags, YAML) as needed."""
 
     base_url: str = POLY_CLOB_BASE
     chain_id: int = POLY_CHAIN_ID_MAINNET
@@ -58,17 +80,71 @@ class CLOBConfig:
     api_secret: str | None = None
     api_passphrase: str | None = None
     signature_type: int = 1  # 1 = Polymarket proxy wallet; 0 = EOA
+    verifying_contract: str | None = None  # defaults via network() when None
+
+    @property
+    def network(self) -> Network:
+        return _network_from_chain_id(self.chain_id)
+
+    def resolved_verifying_contract(self) -> str:
+        """Return the explicit ``verifying_contract`` if set, else the
+        documented default for this network. Imported lazily so ``signer``
+        stays an optional dep for read-only callers."""
+        if self.verifying_contract:
+            return self.verifying_contract
+        from .signer import POLY_CTF_EXCHANGE_AMOY, POLY_CTF_EXCHANGE_MAINNET
+
+        return (
+            POLY_CTF_EXCHANGE_MAINNET
+            if self.network == "mainnet"
+            else POLY_CTF_EXCHANGE_AMOY
+        )
 
     @classmethod
-    def from_env(cls, *, testnet: bool = False) -> CLOBConfig:
+    def for_network(cls, network: Network, **overrides: Any) -> CLOBConfig:
+        """Build a config for ``mainnet`` or ``testnet`` using documented
+        defaults (chain_id + base_url). Override any field via ``**overrides``.
+        """
+        chain_id = POLY_CHAIN_ID_MAINNET if network == "mainnet" else POLY_CHAIN_ID_AMOY
+        base = _default_base_url(network)
+        fields = {"chain_id": chain_id, "base_url": base, **overrides}
+        return cls(**fields)
+
+    @classmethod
+    def from_env(cls, *, testnet: bool | None = None) -> CLOBConfig:
+        """Build from environment variables.
+
+        ``testnet`` is normally derived from ``POLY_NETWORK`` (``mainnet`` or
+        ``testnet``). The explicit kwarg wins if passed, for backwards
+        compatibility with ``scripts/signing_canary.py --testnet``.
+
+        Respected env vars:
+
+        * ``POLY_NETWORK``             — ``mainnet`` | ``testnet``
+        * ``POLY_CLOB_BASE``           — override base URL
+        * ``POLY_PRIVATE_KEY``
+        * ``POLY_FUNDER_ADDRESS``
+        * ``POLY_API_KEY`` / ``POLY_API_SECRET`` / ``POLY_API_PASSPHRASE``
+        * ``POLY_VERIFYING_CONTRACT``  — override the CTF Exchange address
+        """
+        env_net = os.environ.get("POLY_NETWORK", "").lower()
+        if testnet is None:
+            if env_net in ("testnet", "amoy"):
+                network: Network = "testnet"
+            else:
+                network = "mainnet"
+        else:
+            network = "testnet" if testnet else "mainnet"
+        base = os.environ.get("POLY_CLOB_BASE") or _default_base_url(network)
         return cls(
-            base_url=POLY_CLOB_BASE,
-            chain_id=POLY_CHAIN_ID_AMOY if testnet else POLY_CHAIN_ID_MAINNET,
+            base_url=base,
+            chain_id=POLY_CHAIN_ID_AMOY if network == "testnet" else POLY_CHAIN_ID_MAINNET,
             private_key=os.environ.get("POLY_PRIVATE_KEY"),
             funder=os.environ.get("POLY_FUNDER_ADDRESS"),
             api_key=os.environ.get("POLY_API_KEY"),
             api_secret=os.environ.get("POLY_API_SECRET"),
             api_passphrase=os.environ.get("POLY_API_PASSPHRASE"),
+            verifying_contract=os.environ.get("POLY_VERIFYING_CONTRACT"),
         )
 
     def has_signing_creds(self) -> bool:

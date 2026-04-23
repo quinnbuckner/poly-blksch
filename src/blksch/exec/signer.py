@@ -40,10 +40,21 @@ from typing import Literal
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-# Polymarket CTF Exchange, Polygon mainnet (neg-risk exchange differs — see
-# https://docs.polymarket.com/). Kept here as a default; override via config.
+# Polymarket CTF Exchange deployed addresses. Neg-risk exchange differs — see
+# https://docs.polymarket.com/. Kept here as defaults; override via config
+# (``CLOBConfig.verifying_contract`` or ``POLY_VERIFYING_CONTRACT`` env var).
 POLY_CTF_EXCHANGE_MAINNET = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 POLY_NEG_RISK_EXCHANGE_MAINNET = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+
+# Polygon Amoy (test network; chainId 80002). Polymarket has not publicly
+# committed to a stable testnet CTF Exchange deployment, so this is treated
+# as an operator-supplied value — testnet runs MUST set
+# ``POLY_VERIFYING_CONTRACT`` (or ``CLOBConfig.verifying_contract``) to the
+# currently-live address. The zero-address default below is a deliberate
+# "fail-closed" signal: any signed typed-data built against it will mint a
+# recoverable-but-rejected signature, so the canary breaks loudly instead of
+# silently posting a malformed order.
+POLY_CTF_EXCHANGE_AMOY = "0x0000000000000000000000000000000000000000"
 
 
 SIG_EOA = 0

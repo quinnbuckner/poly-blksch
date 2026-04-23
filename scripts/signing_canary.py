@@ -63,6 +63,20 @@ async def _run(token_id: str, far_price: float, size_usd: float, *, testnet: boo
         log.error("Missing POLY_PRIVATE_KEY / POLY_FUNDER_ADDRESS — cannot sign.")
         return 2
 
+    # Testnet sanity: refuse to sign against the fail-closed zero-address.
+    vc = cfg.resolved_verifying_contract()
+    if cfg.network == "testnet" and int(vc, 16) == 0:
+        log.error(
+            "Testnet run refuses to sign against verifying_contract=%s. "
+            "Export POLY_VERIFYING_CONTRACT to the live Amoy CTF Exchange address.",
+            vc,
+        )
+        return 2
+    log.info(
+        "CLOB: network=%s chain_id=%d base=%s verifying_contract=%s",
+        cfg.network, cfg.chain_id, cfg.base_url, vc,
+    )
+
     client = PyCLOBClient(cfg)
     client_id = f"canary-{uuid.uuid4().hex[:10]}"
     size = size_usd / max(far_price, 1e-6)

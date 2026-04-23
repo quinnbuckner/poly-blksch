@@ -3,7 +3,12 @@
 # Paper sections referenced in comments; see ARCHITECTURE.md for module mapping.
 
 mode: paper              # paper | live
-env: mainnet             # mainnet | amoy (testnet)
+network: mainnet         # mainnet | testnet (Polygon Amoy, chainId 80002)
+# `network` selects chain_id + CLOB base URL + CTF Exchange address defaults.
+# Override individual values with env vars:
+#   POLY_NETWORK, POLY_CLOB_BASE, POLY_VERIFYING_CONTRACT
+# Testnet runs MUST export POLY_VERIFYING_CONTRACT (no public default —
+# see src/blksch/exec/signer.py).
 
 # --- Avellaneda-Stoikov in logit units (paper §4.2 eq 8-9) ---
 quoting:

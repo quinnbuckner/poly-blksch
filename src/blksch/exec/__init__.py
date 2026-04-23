@@ -5,7 +5,14 @@ this package, which is fine as a dotted name but import-star would shadow
 the builtin in the caller's namespace.
 """
 
-from .clob_client import CLOBConfig, make_clob_client
+from .clob_client import (
+    CLOBConfig,
+    POLY_CHAIN_ID_AMOY,
+    POLY_CHAIN_ID_MAINNET,
+    POLY_CLOB_BASE,
+    POLY_CLOB_BASE_TESTNET,
+    make_clob_client,
+)
 from .dashboard import DashboardContext, FlaskDashboard, RichDashboard
 from .ledger import (
     Ledger,
