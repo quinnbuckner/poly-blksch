@@ -1,0 +1,68 @@
+[
+  {
+    "nu_b": "-150.0",
+    "output": {
+      "hedge_token_id": "T:xvar",
+      "notional_usd": "1250.0",
+      "reason": "calendar",
+      "side": "long",
+      "source_token_id": "T",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "nu_b": "-10.0",
+    "output": {
+      "hedge_token_id": "T:xvar",
+      "notional_usd": "83.33333333333334",
+      "reason": "calendar",
+      "side": "long",
+      "source_token_id": "T",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "nu_b": "0.0",
+    "output": {
+      "hedge_token_id": "T:xvar",
+      "notional_usd": "0.0",
+      "reason": "calendar",
+      "side": "short",
+      "source_token_id": "T",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "nu_b": "10.0",
+    "output": {
+      "hedge_token_id": "T:xvar",
+      "notional_usd": "83.33333333333334",
+      "reason": "calendar",
+      "side": "short",
+      "source_token_id": "T",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "nu_b": "150.0",
+    "output": {
+      "hedge_token_id": "T:xvar",
+      "notional_usd": "1250.0",
+      "reason": "calendar",
+      "side": "short",
+      "source_token_id": "T",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  },
+  {
+    "nu_b": "1000000.0",
+    "output": {
+      "hedge_token_id": "T:xvar",
+      "notional_usd": "10000.0",
+      "reason": "calendar",
+      "side": "short",
+      "source_token_id": "T",
+      "ts": "2026-04-23T12:00:00Z"
+    }
+  }
+]

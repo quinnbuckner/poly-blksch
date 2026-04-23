@@ -1,0 +1,22 @@
+{
+  "drawdown": {
+    "detail": {
+      "cumulative_pnl_usd": "-500.0"
+    },
+    "reasons": [
+      "max_drawdown"
+    ]
+  },
+  "feed_gap": {
+    "detail": {
+      "feed_gap_sec": "10.0"
+    },
+    "reasons": [
+      "feed_gap"
+    ]
+  },
+  "healthy": {
+    "detail": {},
+    "reasons": []
+  }
+}
