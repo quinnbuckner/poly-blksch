@@ -35,6 +35,7 @@ dev = [
   "pytest-cov>=4.1",
   "ruff>=0.3",
   "mypy>=1.8",
+  "hypothesis>=6.100",
 ]
 clob = [
   "py-clob-client>=0.17",
