@@ -32,11 +32,15 @@ All numerical work is done in log-space with log-sum-exp so a large ``Δt``
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Union
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TYPE_CHECKING, Union
 
 import numpy as np
 from scipy.special import logsumexp
+
+if TYPE_CHECKING:
+    from blksch.schemas import LogitState
 
 DEFAULT_JUMP_THRESHOLD = 0.7
 LOG_TWO_PI = float(np.log(2.0 * np.pi))
@@ -197,10 +201,87 @@ def mark_jumps(
     return g > threshold
 
 
+# ---------------------------------------------------------------------------
+# PosteriorResult + e_step — convenience wrappers for the EM loop
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PosteriorResult:
+    """Output of :func:`e_step` — everything the M-step modules consume.
+
+    Shapes:
+      * ``increments``, ``dts``, ``gamma`` are parallel 1-D arrays of length
+        ``N-1`` given ``N`` input states (one per adjacent pair).
+      * ``end_timestamps`` carries the timestamp of the state that **ends**
+        each increment, so ``jumps.m_step_jumps`` can attribute jump events
+        to their occurrence time without re-taking the state list.
+      * ``params`` is the :class:`MixtureParams` instance used to compute
+        ``gamma`` — M-step modules use it to know what they are refining.
+    """
+
+    increments: np.ndarray
+    dts: np.ndarray
+    gamma: np.ndarray
+    end_timestamps: tuple[datetime, ...]
+    params: MixtureParams
+
+    def __post_init__(self) -> None:
+        n = self.increments.shape[0]
+        if self.dts.shape[0] != n or self.gamma.shape[0] != n:
+            raise ValueError(
+                "increments / dts / gamma length mismatch: "
+                f"{self.increments.shape}, {self.dts.shape}, {self.gamma.shape}"
+            )
+        if len(self.end_timestamps) != n:
+            raise ValueError(
+                f"end_timestamps length {len(self.end_timestamps)} != n={n}"
+            )
+
+    @property
+    def n(self) -> int:
+        return int(self.increments.shape[0])
+
+
+def e_step(
+    states: list["LogitState"],
+    params: MixtureParams,
+) -> PosteriorResult:
+    """Run the E-step on a sequence of :class:`LogitState`.
+
+    Extracts ``Δx̂_t`` and ``Δt_t`` from adjacent states, computes
+    ``γ_t = compute_posteriors(...)``, and packs everything into a
+    :class:`PosteriorResult`. Returns an empty result for runs shorter
+    than two states.
+    """
+    if len(states) < 2:
+        return PosteriorResult(
+            increments=np.zeros(0, dtype=float),
+            dts=np.zeros(0, dtype=float),
+            gamma=np.zeros(0, dtype=float),
+            end_timestamps=tuple(),
+            params=params,
+        )
+    x = np.array([s.x_hat for s in states], dtype=float)
+    ts = [s.ts for s in states]
+    increments = np.diff(x)
+    dts = np.array([(ts[i + 1] - ts[i]).total_seconds() for i in range(len(ts) - 1)], dtype=float)
+    gamma = compute_posteriors(increments, dts, params)
+    return PosteriorResult(
+        increments=increments,
+        dts=dts,
+        gamma=gamma,
+        end_timestamps=tuple(ts[1:]),
+        params=params,
+    )
+
+
 __all__ = [
     "DEFAULT_JUMP_THRESHOLD",
     "MixtureParams",
+    "PosteriorResult",
     "compute_posteriors",
+    "e_step",
     "gaussian_log_pdf",
     "log_likelihood",
     "mark_jumps",
