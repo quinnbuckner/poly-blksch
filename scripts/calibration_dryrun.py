@@ -38,7 +38,7 @@ import math
 import os
 import sys
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -104,6 +104,10 @@ class DryrunConfig:
     ewma_half_life_sec: float = DEFAULT_EWMA_HALF_LIFE_SEC
     microstruct_fit_window: int = DEFAULT_MICROSTRUCT_FIT_WINDOW
     i_mean_it: bool = False
+    # ``None`` means the operator did not pass ``--log-level``; in that
+    # case ``resolve_log_level`` falls back to the ``LOG_LEVEL`` env var
+    # and finally to "INFO". An explicit CLI value always wins.
+    log_level: str | None = None
 
     def __post_init__(self) -> None:
         if self.minutes <= 0:
@@ -164,10 +168,27 @@ def build_argparser() -> argparse.ArgumentParser:
              "without the flag.",
     )
     p.add_argument(
-        "--log-level", default="INFO",
+        "--log-level", default=None,
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        help="Logging verbosity. Default: LOG_LEVEL env var, else INFO. "
+             "An explicit CLI value always wins over the env var.",
     )
     return p
+
+
+def resolve_log_level(
+    cli_value: str | None,
+    env: "Mapping[str, str] | None" = None,
+) -> str:
+    """Effective log level with precedence CLI > env > 'INFO'.
+
+    Split out of ``main`` so it is unit-testable without touching the
+    real logging framework or the process environment.
+    """
+    if cli_value:
+        return cli_value
+    env_map = env if env is not None else os.environ
+    return env_map.get("LOG_LEVEL", "INFO")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> DryrunConfig:
@@ -197,6 +218,7 @@ def parse_args(argv: Sequence[str] | None = None) -> DryrunConfig:
         ewma_half_life_sec=float(ns.ewma_half_life_sec),
         microstruct_fit_window=int(ns.microstruct_fit_window),
         i_mean_it=bool(ns.i_mean_it),
+        log_level=ns.log_level,
     )
 
 
@@ -719,38 +741,48 @@ async def ingest_and_snapshot(
     except Exception as exc:  # noqa: BLE001
         log.warning("REST warm-up failed: %s (continuing on WS only)", exc)
 
-    async for event in client.stream_market([token_id]):
-        elapsed = float(clock() - start)
-        if isinstance(event, BookSnap):
-            books.append(event)
-            if store is not None:
-                await store.append_book(event)
-        elif isinstance(event, TradeTick):
-            trades.append(event)
-            if store is not None:
-                await store.append_trade(event)
-        while next_idx < len(snapshot_times) and elapsed >= snapshot_times[next_idx]:
-            t = snapshot_times[next_idx]
-            log.info("t+%ds: running calibration snapshot "
-                     "(n_books=%d, n_trades=%d)", t, len(books), len(trades))
-            snap = run_calibration_snapshot(
-                books, trades,
-                token_id=token_id, t_elapsed_sec=t,
-                bot_config=config.bot_config,
-                horizon_sec=config.horizon_sec,
-                ewma_half_life_sec=config.ewma_half_life_sec,
-                microstruct_fit_window=config.microstruct_fit_window,
-            )
-            snapshots.append(snap)
-            log.info("t+%ds: verdict=%s σ̂_b=%s λ̂=%s ŝ²_J=%s",
-                     t, snap.verdict, snap.sigma_b_hat, snap.lambda_hat,
-                     snap.s_J_sq_hat)
-            next_idx += 1
-        if elapsed >= duration_sec:
-            break
+    # Capture the generator so we can explicitly ``aclose`` it on any exit
+    # path. Relying on GC for an async-WS generator leaves the CLOB
+    # connection half-open on exceptions and delays the process shutdown.
+    stream = client.stream_market([token_id])
+    try:
+        async for event in stream:
+            elapsed = float(clock() - start)
+            if isinstance(event, BookSnap):
+                books.append(event)
+                if store is not None:
+                    await store.append_book(event)
+            elif isinstance(event, TradeTick):
+                trades.append(event)
+                if store is not None:
+                    await store.append_trade(event)
+            while next_idx < len(snapshot_times) and elapsed >= snapshot_times[next_idx]:
+                t = snapshot_times[next_idx]
+                log.info("t+%ds: running calibration snapshot "
+                         "(n_books=%d, n_trades=%d)", t, len(books), len(trades))
+                snap = run_calibration_snapshot(
+                    books, trades,
+                    token_id=token_id, t_elapsed_sec=t,
+                    bot_config=config.bot_config,
+                    horizon_sec=config.horizon_sec,
+                    ewma_half_life_sec=config.ewma_half_life_sec,
+                    microstruct_fit_window=config.microstruct_fit_window,
+                )
+                snapshots.append(snap)
+                log.info("t+%ds: verdict=%s σ̂_b=%s λ̂=%s ŝ²_J=%s",
+                         t, snap.verdict, snap.sigma_b_hat, snap.lambda_hat,
+                         snap.s_J_sq_hat)
+                next_idx += 1
+            if elapsed >= duration_sec:
+                break
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 — cleanup must never mask errors
+                log.debug("stream aclose raised", exc_info=True)
 
-    if store is not None:
-        await store.close()
     return snapshots
 
 
@@ -781,10 +813,23 @@ async def main_async(config: DryrunConfig, header: dict[str, Any]) -> int:
         token_id = await _resolve_token_id(client, config)
         log.info("ingesting token_id=%s for %d minutes into %s",
                  token_id, config.minutes, config.out_dir)
+        # ParquetStore buffers in memory and flushes on ``close()``. On any
+        # exception inside ``ingest_and_snapshot`` the buffer would be
+        # lost without the explicit finally; the outer ``async with
+        # PolyClient()`` would then just propagate the exception and exit
+        # with the last partial snapshots un-persisted. Close it
+        # regardless of exit path.
         store = ParquetStore(config.out_dir / "ticks")
-        snapshots = await ingest_and_snapshot(
-            client, token_id, config=config, store=store,
-        )
+        try:
+            snapshots = await ingest_and_snapshot(
+                client, token_id, config=config, store=store,
+            )
+        finally:
+            try:
+                await store.close()
+            except Exception:  # noqa: BLE001 — cleanup must not mask the original error
+                log.warning("ParquetStore.close() raised during teardown", exc_info=True)
+
         report = render_report(header, token_id, snapshots, config.bot_config)
         path = write_report(report, config.out_dir)
         log.info("wrote report to %s", path)
@@ -809,9 +854,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ewma_half_life_sec=config.ewma_half_life_sec,
         microstruct_fit_window=config.microstruct_fit_window,
         i_mean_it=config.i_mean_it,
+        log_level=config.log_level,
     )
     logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
+        level=resolve_log_level(config.log_level),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     header = log_header("calibration_dryrun.py", argv)

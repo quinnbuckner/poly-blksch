@@ -113,6 +113,42 @@ def test_log_header_shape() -> None:
     datetime.fromisoformat(header["ts"])
 
 
+# ---------- Log-level resolution (CLI > env > default) ----------
+
+
+def test_log_level_default_is_info_when_nothing_set() -> None:
+    assert cd.resolve_log_level(cli_value=None, env={}) == "INFO"
+
+
+def test_log_level_env_var_takes_effect_when_cli_absent() -> None:
+    assert cd.resolve_log_level(cli_value=None, env={"LOG_LEVEL": "DEBUG"}) == "DEBUG"
+
+
+def test_log_level_cli_overrides_env_var() -> None:
+    """Regression: the --log-level CLI flag was silent because main() read
+    LOG_LEVEL from os.environ directly. Now the CLI wins."""
+    effective = cd.resolve_log_level(
+        cli_value="DEBUG", env={"LOG_LEVEL": "WARNING"},
+    )
+    assert effective == "DEBUG"
+
+
+def test_log_level_cli_overrides_even_when_env_is_same_default() -> None:
+    assert cd.resolve_log_level(cli_value="WARNING", env={"LOG_LEVEL": "INFO"}) == "WARNING"
+
+
+def test_parse_args_threads_cli_log_level_through_to_config() -> None:
+    cfg = cd.parse_args(
+        ["--auto", "--minutes", "5", "--out", "./x", "--log-level", "DEBUG"]
+    )
+    assert cfg.log_level == "DEBUG"
+
+
+def test_parse_args_log_level_none_when_absent() -> None:
+    cfg = cd.parse_args(["--auto", "--minutes", "5", "--out", "./x"])
+    assert cfg.log_level is None
+
+
 # ---------- Verdict ----------
 
 
