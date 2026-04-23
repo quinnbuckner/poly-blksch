@@ -397,7 +397,10 @@ async def test_run_soak_happy_path(monkeypatch, tmp_path):
     assert final.exists()
     import json
     blob = json.loads(final.read_text())
-    assert blob["hours_observed"] >= 1
+    # ``hours_observed`` is now wall-time-floor (was len(reports)). The
+    # fake-clock test doesn't advance time.time() so hours_observed is 0;
+    # the schedule-hours count moved to ``hourly_reports_collected``.
+    assert blob["hourly_reports_collected"] >= 1
     assert "acceptance" in blob
     # With monotonically increasing realized minus fees, edge per fill > 0.
     assert result.passed is True
@@ -719,4 +722,313 @@ async def test_run_soak_does_not_carry_stale_realized_pnl_into_next_hour(
     assert hour1[3] == 0, (
         f"BUG-3: hour 1's fills_count_at_start carried stale 1 instead of "
         f"the latest 0 observation; got {hour1[3]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-soak audit round 2 — rehearsal bugs surfaced by the planning window
+# against 97042c8 (stdout-pipe / sampler-recovery / hour-carryover). Each
+# bug here fires only under real-run conditions so pin with focused tests.
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_uses_tokens_not_market(tmp_path):
+    """ROUND2 BUG-1 regression: ``resolved_cmd()`` must emit ``--tokens``,
+    not ``--market``. app.py defines ``--markets`` (YAML path) and
+    ``--tokens`` (comma-separated token_ids); argparse prefix-matches
+    ``--market`` onto ``--markets``, so the child tried to
+    ``open('<token_id>')`` and died with FileNotFoundError in ~1s, making
+    every ``--token-id`` invocation unusable.
+    """
+    cfg = soak.SoakConfig(
+        hours=1,
+        out_dir=tmp_path,
+        token_id="0xaabbccdd",
+    )
+    cmd = cfg.resolved_cmd()
+    assert "--tokens" in cmd, (
+        f"resolved_cmd must emit --tokens (app.py's flag); got {cmd}"
+    )
+    # The stale spelling must NOT be emitted — it prefix-matches onto
+    # --markets and silently breaks.
+    assert "--market" not in cmd, (
+        f"--market prefix-matches onto --markets (YAML path flag); "
+        f"resolved_cmd must NOT emit it. Got {cmd}"
+    )
+    # The token value must follow the flag positionally.
+    i = cmd.index("--tokens")
+    assert cmd[i + 1] == "0xaabbccdd"
+
+
+async def test_artifacts_written_on_cancellation(monkeypatch, tmp_path):
+    """ROUND2 BUG-2 regression: ``evaluate()`` and ``_write_final()`` used
+    to live AFTER the try/finally. An operator SIGINT during hour 71 of
+    a 72 h run raised KeyboardInterrupt past them and lost the verdict.
+
+    Inside ``asyncio.run``, SIGINT manifests as ``CancelledError`` inside
+    the running coroutine — trigger that directly via a sampler that
+    raises it to simulate the interrupt without touching real signals
+    (keeps the test deterministic across CI environments).
+    """
+    fake_clock = _FakeClock()
+
+    cancelled_after = [0]
+
+    async def sampler_that_cancels_mid_run(url):
+        cancelled_after[0] += 1
+        if cancelled_after[0] >= 3:
+            raise asyncio.CancelledError("simulated operator SIGINT")
+        return _snapshot(
+            quotes={"t": {}}, fills_count=cancelled_after[0],
+            realized=0.1 * cancelled_after[0], fees=0.005 * cancelled_after[0],
+        )
+
+    monkeypatch.setattr(soak, "_spawn_app", lambda cmd, out_dir: _FakeProc())
+    monkeypatch.setattr(soak, "_shutdown_child", lambda proc: None)
+
+    real_sleep = asyncio.sleep
+
+    async def instant_sleep(dt):
+        fake_clock.tick(dt)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+
+    cfg = soak.SoakConfig(
+        hours=1,
+        out_dir=tmp_path,
+        sample_interval_sec=100.0,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await soak.run_soak(cfg, sampler=sampler_that_cancels_mid_run,
+                            clock=fake_clock)
+
+    # The finally block MUST have persisted the verdict even though the
+    # CancelledError propagated out of run_soak.
+    final = tmp_path / "final_report.json"
+    assert final.exists(), (
+        "BUG-2: final_report.json must be written in the finally block so "
+        "SIGINT mid-run never loses the verdict"
+    )
+    import json as _json
+    blob = _json.loads(final.read_text())
+    assert "acceptance" in blob, "partial verdict must include acceptance dict"
+    # Acceptance on a partial run: passed=False is expected (inventory/
+    # uptime/duration criteria not met), but that is not what this test
+    # pins — it pins that the file exists at all.
+    assert "passed" in blob["acceptance"]
+
+
+def test_exit_code_reflects_acceptance_passed(monkeypatch, tmp_path):
+    """ROUND2 BUG-3 regression: supervisor must exit non-zero when
+    ``acceptance.passed`` is False. Cron / CI that trust the process
+    exit code rely on this.
+
+    Stub run_soak to return a known-failing AcceptanceResult and assert
+    main() returns 1. Also stub the happy path to return passed=True and
+    assert main() returns 0. The stub pattern sidesteps network and
+    keeps the test under a millisecond.
+
+    Kept SYNC (not async) because main() drives its own ``asyncio.run``
+    — an outer event loop (async test) would collide with that.
+    """
+    fail_result = soak.AcceptanceResult(
+        passed=False,
+        results=[soak.CriterionResult(
+            name="min_hours", passed=False, observed=0, threshold=72,
+            message="stubbed failure",
+        )],
+    )
+    ok_result = soak.AcceptanceResult(
+        passed=True,
+        results=[soak.CriterionResult(
+            name="min_hours", passed=True, observed=72, threshold=72,
+            message="stubbed success",
+        )],
+    )
+
+    async def _fail_run(cfg, *, criteria=None):
+        # Simulate run_soak's finally: write the JSON, return the result.
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        soak._write_final(cfg.out_dir, [], fail_result,
+                          elapsed_wall_time_sec=0.0)
+        return fail_result
+
+    async def _ok_run(cfg, *, criteria=None):
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        soak._write_final(cfg.out_dir, [], ok_result,
+                          elapsed_wall_time_sec=0.0)
+        return ok_result
+
+    # FAIL case → exit 1
+    monkeypatch.setattr(soak, "run_soak", _fail_run)
+    rc = soak.main([
+        "--i-mean-it", "--hours", "1",
+        "--out", str(tmp_path / "fail"),
+    ])
+    assert rc == 1, (
+        f"BUG-3: main() must exit 1 when acceptance.passed=False; got {rc}"
+    )
+
+    # PASS case → exit 0
+    monkeypatch.setattr(soak, "run_soak", _ok_run)
+    rc = soak.main([
+        "--i-mean-it", "--hours", "1",
+        "--out", str(tmp_path / "ok"),
+    ])
+    assert rc == 0, f"main() must exit 0 when passed=True; got {rc}"
+
+
+async def test_hours_observed_reflects_wall_time(monkeypatch, tmp_path):
+    """ROUND2 BUG-4 regression: ``hours_observed`` must be wall-time
+    floor, not ``len(reports)``. A 1-second crashed soak used to report
+    hours_observed=1 (because the inner break still finalized and
+    appended one HourlyReport); operators interpret that field as
+    "hours the soak actually ran" and the inflated count masked crash-
+    fast scenarios. The scheduled-hour count moved to a new field
+    ``hourly_reports_collected`` for callers that want that semantic.
+    """
+    # Stub time.time so the test is deterministic — first call (wall_run_start)
+    # returns 1000.0; subsequent calls (including the elapsed computation
+    # in the finally) also return 1000.0, so elapsed ≈ 0 and
+    # hours_observed == 0 regardless of how many reports are appended.
+    monkeypatch.setattr(soak.time, "time", lambda: 1000.0)
+
+    samples = [
+        _snapshot(quotes={"t": {}}, fills_count=i, realized=0.1 * i,
+                  fees=0.005 * i)
+        for i in range(1, 100)
+    ]
+    sample_iter = iter(samples)
+
+    async def fake_sampler(url):
+        try:
+            return next(sample_iter)
+        except StopIteration:
+            return samples[-1]
+
+    fake_clock = _FakeClock()
+    monkeypatch.setattr(soak, "_spawn_app", lambda cmd, out_dir: _FakeProc())
+    monkeypatch.setattr(soak, "_shutdown_child", lambda proc: None)
+
+    real_sleep = asyncio.sleep
+
+    async def instant_sleep(dt):
+        fake_clock.tick(dt)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+
+    cfg = soak.SoakConfig(
+        hours=2,
+        out_dir=tmp_path,
+        sample_interval_sec=100.0,
+    )
+    await soak.run_soak(cfg, sampler=fake_sampler, clock=fake_clock)
+
+    import json as _json
+    blob = _json.loads((tmp_path / "final_report.json").read_text())
+    # 2 reports accumulated via the fake-clock loop...
+    assert blob["hourly_reports_collected"] >= 1
+    # ...but hours_observed is 0 because NO wall time elapsed.
+    assert blob["hours_observed"] == 0, (
+        f"BUG-4: hours_observed must be floor(elapsed_wall_time/3600); "
+        f"got {blob['hours_observed']} for a zero-wall-time fake run"
+    )
+    # And elapsed_wall_time_sec is a new field; check shape.
+    assert "elapsed_wall_time_sec" in blob
+    assert blob["elapsed_wall_time_sec"] == 0.0
+
+
+def test_hours_accepts_float_via_cli(tmp_path):
+    """ROUND2 enhancement: ``--hours`` accepts fractional values so
+    rehearsals can run ``--hours 0.05`` (≈3 min). Previously typed as
+    int so argparse rejected ``0.05`` before the script even started.
+    """
+    # Dry-run mode — no network, no subprocess, just argparse round-trip.
+    rc = soak.main([
+        "--hours", "0.05",
+        "--out", str(tmp_path),
+    ])
+    assert rc == 0, f"dry-run with float --hours must succeed; got rc={rc}"
+
+    # Structural: ensure the CLI is actually typed float now. If someone
+    # flips it back to int, ``--hours 0.05`` errors out with argparse
+    # exit code 2 (SystemExit) before returning.
+    import argparse as _ap
+    try:
+        rc = soak.main(["--hours", "0.05", "--out", str(tmp_path / "x")])
+    except SystemExit as exc:
+        pytest.fail(
+            f"--hours must accept float values; argparse rejected 0.05 "
+            f"with SystemExit({exc.code}). Did the type revert to int?"
+        )
+
+
+def test_child_rc_zero_logs_at_info_not_error(monkeypatch, tmp_path, caplog):
+    """ROUND2 BUG-5 regression: a clean child exit (rc=0) was being
+    logged at ERROR level as 'child exited unexpectedly'. rc=0 means
+    the child honored SIGTERM or hit ``--max-runtime-sec`` — a NORMAL
+    exit path. Downgrade to INFO, keep ERROR for non-zero.
+    """
+
+    class _CleanExitProc:
+        pid = 1234
+        returncode = 0
+        _polled = 0
+
+        def poll(self):
+            # First poll returns None (alive) so the loop body executes;
+            # subsequent polls return 0 so the inner break fires once.
+            self._polled += 1
+            return None if self._polled <= 1 else 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    fake_clock = _FakeClock()
+    monkeypatch.setattr(soak, "_spawn_app", lambda cmd, out_dir: _CleanExitProc())
+    monkeypatch.setattr(soak, "_shutdown_child", lambda proc: None)
+
+    samples = [_snapshot() for _ in range(5)]
+    it = iter(samples)
+
+    async def fake_sampler(url):
+        try:
+            return next(it)
+        except StopIteration:
+            return samples[-1]
+
+    real_sleep = asyncio.sleep
+
+    async def instant_sleep(dt):
+        fake_clock.tick(dt)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+
+    cfg = soak.SoakConfig(hours=1, out_dir=tmp_path, sample_interval_sec=100.0)
+
+    caplog.set_level(logging.INFO, logger="paper_soak")
+
+    async def _go():
+        await soak.run_soak(cfg, sampler=fake_sampler, clock=fake_clock)
+
+    asyncio.run(_go())
+
+    error_msgs = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    info_msgs = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+
+    # The "unexpectedly" phrasing is reserved for non-zero rc now.
+    unexpected_errors = [m for m in error_msgs if "exited unexpectedly" in m]
+    assert unexpected_errors == [], (
+        f"BUG-5: rc=0 must NOT log at ERROR as 'exited unexpectedly'; "
+        f"got: {unexpected_errors}"
+    )
+    # And the INFO message for the clean-exit path must have fired.
+    clean_infos = [m for m in info_msgs if "exited cleanly" in m]
+    assert clean_infos, (
+        f"BUG-5: rc=0 child exit must be announced at INFO as 'exited "
+        f"cleanly'; got INFO messages: {info_msgs}"
     )

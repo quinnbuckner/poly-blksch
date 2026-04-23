@@ -352,7 +352,7 @@ async def sample_dashboard(url: str, *, timeout_sec: float = 2.0) -> dict[str, A
 
 @dataclass
 class SoakConfig:
-    hours: int = 72
+    hours: float = 72.0
     dashboard_url: str = "http://127.0.0.1:5055/api/state"
     sample_interval_sec: float = 5.0
     out_dir: Path = field(default_factory=lambda: Path("./soak_output"))
@@ -368,7 +368,11 @@ class SoakConfig:
     def resolved_cmd(self) -> list[str]:
         cmd = list(self.app_cmd)
         if self.token_id:
-            cmd.extend(["--market", self.token_id])
+            # app.py accepts ``--tokens`` (comma-separated list) — NOT
+            # ``--market``. The previous spelling let argparse prefix-match
+            # onto ``--markets`` (the YAML path flag), so the child tried
+            # to ``open('<token_id>')`` and died in ~1s with FileNotFound.
+            cmd.extend(["--tokens", self.token_id])
         cmd.extend(self.extra_app_args)
         if "--mode=paper" not in cmd and "paper" not in cmd:
             raise RuntimeError(
@@ -427,6 +431,7 @@ async def run_soak(
     proc = _spawn_app(cmd, cfg.out_dir)
 
     reports: list[HourlyReport] = []
+    wall_run_start = time.time()
     hour_start = clock()
     wall_start = time.time()
     aggregate = HourlyAggregate(
@@ -449,7 +454,18 @@ async def run_soak(
                 if clock() - hour_start + (len(reports) * 3600.0) >= deadline_sec:
                     break
                 if proc.poll() is not None:
-                    log.error("child exited unexpectedly with code %d", proc.returncode)
+                    rc = proc.returncode
+                    if rc == 0:
+                        # Normal exit path — child honored SIGTERM or hit
+                        # ``--max-runtime-sec``. Logging at ERROR was noise
+                        # during every rehearsal; drop to INFO for rc=0
+                        # while keeping real crashes loud.
+                        log.info(
+                            "child exited cleanly (rc=0) — treating as "
+                            "normal shutdown",
+                        )
+                    else:
+                        log.error("child exited unexpectedly with code %d", rc)
                     break
                 try:
                     snap = await sample_fn(cfg.dashboard_url)
@@ -522,10 +538,25 @@ async def run_soak(
                 fees_at_start=last_fees,
             )
     finally:
+        # Shutdown, evaluate, and write the final verdict BEFORE letting
+        # any exception propagate. An operator SIGINT during hour 71 of
+        # a 72 h run used to lose the entire verdict because evaluate()
+        # and _write_final() lived after the try/finally — the partial
+        # aggregate was written per-hour but the acceptance gate output
+        # never hit disk. Moving the verdict-write into finally means
+        # the JSON is always written on every exit path (clean, SIGINT,
+        # child-crash, bug in the loop body) so the operator can always
+        # inspect how far the soak got and which criteria would have
+        # failed. ``result`` is re-exposed as a function-scope local so
+        # the normal-return ``return result`` below still works.
         _shutdown_child(proc)
+        elapsed_wall_time_sec = time.time() - wall_run_start
+        result = evaluate(reports, criteria)
+        _write_final(
+            cfg.out_dir, reports, result,
+            elapsed_wall_time_sec=elapsed_wall_time_sec,
+        )
 
-    result = evaluate(reports, criteria)
-    _write_final(cfg.out_dir, reports, result)
     return result
 
 
@@ -544,10 +575,22 @@ def _write_final(
     out_dir: Path,
     reports: list[HourlyReport],
     result: AcceptanceResult,
+    *,
+    elapsed_wall_time_sec: float,
 ) -> None:
+    # ``hours_observed`` used to be ``len(reports)`` — the count of hour
+    # boundaries crossed, which inflates for short runs. A 1-second soak
+    # that crashed immediately still appended one finalized (0-sample)
+    # report inside the inner break, so the JSON reported hours_observed=1
+    # for an effective run duration of ~0. Use wall-time floor instead so
+    # the field honors the operator's "how long did this actually run"
+    # question and matches the CLI's ``--hours`` semantics.
+    hours_observed = int(elapsed_wall_time_sec // 3600)
     path = out_dir / "final_report.json"
     path.write_text(json.dumps({
-        "hours_observed": len(reports),
+        "hours_observed": hours_observed,
+        "elapsed_wall_time_sec": round(elapsed_wall_time_sec, 3),
+        "hourly_reports_collected": len(reports),
         "acceptance": result.to_dict(),
         "reports": [r.to_dict() for r in reports],
     }, indent=2))
@@ -600,7 +643,13 @@ def _print_plan(cfg: SoakConfig, criteria: AcceptanceCriteria) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="72-hour paper-trading soak supervisor")
-    parser.add_argument("--hours", type=int, default=72)
+    parser.add_argument(
+        "--hours", type=float, default=72.0,
+        help=(
+            "Soak duration in hours. Accepts fractional values for "
+            "rehearsals (e.g. --hours 0.05 ≈ 3 minutes)."
+        ),
+    )
     parser.add_argument("--dashboard-url", default="http://127.0.0.1:5055/api/state")
     parser.add_argument("--sample-interval-sec", type=float, default=5.0)
     parser.add_argument("--out", type=Path, default=Path("./soak_output"))
@@ -663,8 +712,43 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", exc)
         return 2
 
-    result = asyncio.run(run_soak(cfg, criteria=criteria))
+    # Exit code contract:
+    #   * 0  only when acceptance.passed is True
+    #   * 1  on any other verdict (explicit failure OR interrupted mid-run
+    #        with a partial verdict that didn't pass)
+    #   * 2  on structural errors (cannot determine a verdict at all)
+    #
+    # Cron / CI rely on this contract — the supervisor used to exit 0 when
+    # acceptance.passed was False because the normal-path return wasn't
+    # reached under SIGINT / unexpected-exception exits. Now
+    # ``run_soak``'s ``finally`` always writes ``final_report.json``, and
+    # on any interrupt we read it back to determine the verdict so the
+    # operator / CI gets the same answer as the JSON.
+    try:
+        result = asyncio.run(run_soak(cfg, criteria=criteria))
+    except KeyboardInterrupt:
+        log.warning(
+            "paper_soak interrupted — verdict in %s/final_report.json",
+            cfg.out_dir,
+        )
+        return _exit_code_from_final_report(cfg.out_dir)
+
     return 0 if result.passed else 1
+
+
+def _exit_code_from_final_report(out_dir: Path) -> int:
+    """Read ``out_dir/final_report.json`` and map the acceptance verdict
+    to an exit code. Returns 2 if the file is missing / unparseable — the
+    operator must know when we cannot determine a verdict at all.
+    """
+    final = out_dir / "final_report.json"
+    try:
+        blob = json.loads(final.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        log.error("final_report.json unreadable (%s): %s", type(exc).__name__, exc)
+        return 2
+    passed = bool(blob.get("acceptance", {}).get("passed", False))
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
