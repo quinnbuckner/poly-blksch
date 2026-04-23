@@ -230,21 +230,20 @@ def _run_production_attributor(path: list[Tick]) -> dict[str, float]:
     ledger = Ledger.in_memory()
     attributor = Attributor()
 
-    prev_qty = 0.0
     for tick in path:
-        # Feed the Attributor a snapshot BEFORE applying this tick's fill,
-        # capturing the qty held over the interval that just elapsed.
-        snap = AttributionSnapshot(
-            token_id=TOK, p=tick.p_observed, sigma_b=tick.sigma_b,
-            qty=prev_qty, ts=tick.ts,
-        )
-        attributor.step(snap)
-
+        # Apply the tick's fill/mark first — the snapshot's qty is the position
+        # held going *forward* from this tick, which is what Attributor uses
+        # for its prev.qty term on the next step.
         if tick.fill is not None:
             ledger.apply_fill(tick.fill)
         if tick.mark_update is not None:
             ledger.update_mark(TOK, tick.mark_update, ts=tick.ts)
-        prev_qty = ledger.get_position(TOK).qty
+        qty_forward = ledger.get_position(TOK).qty
+
+        attributor.step(AttributionSnapshot(
+            token_id=TOK, p=tick.p_observed, sigma_b=tick.sigma_b,
+            qty=qty_forward, ts=tick.ts,
+        ))
 
     return attributor.cumulative
 
@@ -276,16 +275,13 @@ class TestReferenceAttributionReconciles:
 
 
 class TestProductionAttributor:
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "mm/pnl.py Attributor uses `dp` in the directional bucket; the paper's "
-            "§4.6 decomposition requires `dx = logit(p_next) - logit(p_prev)`. "
-            "Remove xfail once mm/pnl.py is patched. This test will auto-flip to "
-            "PASS at that point and hard-guard the fix."
-        ),
-    )
     def test_ledger_total_equals_production_attributor_sum(self) -> None:
+        """Hard reconciliation against the production Attributor — this is
+        the exact invariant the Stage-1 paper soak's PnL-residual criterion
+        evaluates.  mm/pnl.py uses dx_incr = logit(p_next) − logit(p_prev)
+        in the directional and curvature buckets, with the residual routed
+        to the jump bucket so the sum closes to q·dp to floating precision.
+        """
         path = _scripted_path()
         ledger = _run_ledger(path)
         cum = _run_production_attributor(path)

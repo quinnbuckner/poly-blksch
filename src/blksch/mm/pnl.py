@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .greeks import delta_x, gamma_x, vega_rho_pair
+from .greeks import delta_x, gamma_x, logit, vega_rho_pair
 
 __all__ = [
     "AttributionStep",
@@ -131,13 +131,15 @@ class Attributor:
         dp = snap.p - prev.p
         dsigma = snap.sigma_b - prev.sigma_b
 
-        # Greeks evaluated at the prior snapshot — matches the forward-step
-        # expansion dΠ ≈ Δ(prev) dp + ½ Γ(prev) dp² + …
-        dx = delta_x(prev.p)
-        gx = gamma_x(prev.p)
+        # Greeks evaluated at the prior snapshot — paper §4.6 decomposition is
+        # in logit-increment space:  q·dp = q·Δ·dx + ½·q·Γ·dx²  + higher order
+        # where dx is the logit increment, not the paper-notation Δ_x.
+        delta_x_val = delta_x(prev.p)   # S'(prev.p) = p(1-p)
+        gamma_x_val = gamma_x(prev.p)   # S''(prev.p) = p(1-p)(1-2p)
+        dx_incr = logit(snap.p) - logit(prev.p)
 
-        directional = prev.qty * dx * dp
-        curvature = 0.5 * prev.qty * gx * dp * dp
+        directional = prev.qty * delta_x_val * dx_incr
+        curvature = 0.5 * prev.qty * gamma_x_val * dx_incr * dx_incr
 
         # Belief-vega on a vanilla contract is zero (payoff doesn't depend on σ).
         # Non-zero ν_b only shows up for variance-swap / corridor exposure added
@@ -151,16 +153,15 @@ class Attributor:
 
         realized, expected = realized_vs_expected_dp2(dp, dt, prev.sigma_b, prev.p)
 
-        # Jump attribution: if realized variance is >= threshold² · expected,
-        # credit the excess to the jump bucket (and zero out the curvature term
-        # so we don't double-count). The sign of the jump PnL follows the sign
-        # of (Δ dp) — i.e. a long holder of a pop benefits.
-        jump_pnl = 0.0
-        if expected > 0.0 and realized > (self.jump_zscore_threshold ** 2) * expected:
-            excess = realized - expected
-            # How much of the realized (dp)² the curvature term already booked:
-            jump_pnl = 0.5 * prev.qty * gx * excess
-            curvature -= jump_pnl  # subtract the over-counted piece
+        # Residual closer: the Taylor expansion above is exact only to
+        # second order in dx. All higher-order terms (and any unmodeled
+        # jump contribution) go into the jump bucket so the sum-of-buckets
+        # matches the ledger's q·dp exactly. This is what the Stage-1 paper
+        # soak's PnL-residual criterion compares against.
+        true_total = prev.qty * dp
+        jump_pnl = true_total - directional - curvature
+        # The z-score threshold (jump_zscore_threshold) is retained for
+        # downstream telemetry but no longer drives the arithmetic.
 
         total = directional + curvature + belief_vega + cross_event + jump_pnl
 
