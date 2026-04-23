@@ -23,9 +23,24 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _load(name: str) -> dict | list:
+    """Load a JSON or JSONL fixture.
+
+    ``.jsonl`` files are decoded line-by-line into a list — the recorder
+    (``scripts/record_contract_fixtures.py``) writes one WS frame per
+    line so re-running against a live subscription appends cleanly.
+    Everything else goes through ``json.load``.
+    """
     path = FIXTURES / name
     if not path.exists():
         pytest.skip(f"Fixture {name} not recorded yet — see tests/contract/README.md")
+    if path.suffix == ".jsonl":
+        out: list = []
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return out
     with path.open() as f:
         return json.load(f)
 
