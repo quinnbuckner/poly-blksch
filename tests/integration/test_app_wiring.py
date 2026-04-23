@@ -381,7 +381,154 @@ async def test_screener_failure_does_not_close_injected_ledger() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (6) Config error messages include the YAML path
+# (6) Regression: WS stream is explicitly aclose()d on shutdown
+# ---------------------------------------------------------------------------
+
+
+class _AcloseTrackingStream:
+    """Stand-in for the async-gen returned by ``client.stream_market``.
+
+    Implements the subset of the async-iterator protocol that
+    ``ingest_loop`` uses (``__aiter__`` / ``__anext__``) *plus* a plain
+    ``aclose`` method that flips a flag. Unlike a native async-gen, our
+    ``aclose`` doesn't run any generator teardown; it only records that
+    the ingest_loop called it. That way we can assert the ``finally``
+    block runs ``await stream.aclose()`` on every exit path.
+    """
+
+    def __init__(self, events: list[ScriptedEvent]) -> None:
+        self._events = list(events)
+        self.aclose_called = False
+
+    def __aiter__(self) -> "_AcloseTrackingStream":
+        return self
+
+    async def __anext__(self) -> BookSnap | TradeTick:
+        if self._events:
+            scripted = self._events.pop(0)
+            if scripted.delay_sec > 0:
+                await asyncio.sleep(scripted.delay_sec)
+            return scripted.event
+        # After the scripted sequence, park on a long sleep so the test
+        # controls shutdown via stop_event rather than StopAsyncIteration.
+        await asyncio.sleep(3600.0)
+        raise StopAsyncIteration  # pragma: no cover — cancelled before this
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+
+
+class _AcloseTrackingClient(MockPolyClient):
+    """MockPolyClient variant whose ``stream_market`` returns an
+    ``_AcloseTrackingStream`` so the test can assert ingest_loop closed it.
+    """
+
+    def __init__(self, events: Iterable[ScriptedEvent]) -> None:
+        super().__init__(events)
+        self.stream: _AcloseTrackingStream | None = None
+
+    def stream_market(  # type: ignore[override]
+        self, token_ids: list[str] | tuple[str, ...], **kw: Any,
+    ) -> _AcloseTrackingStream:
+        wanted = set(token_ids)
+        filtered = [e for e in self._events if e.event.token_id in wanted]
+        self.stream = _AcloseTrackingStream(filtered)
+        return self.stream
+
+
+@pytest.mark.asyncio
+async def test_ingest_loop_acloses_stream_on_stop_event() -> None:
+    """Regression for a pre-soak-audit bug Track A caught in
+    ``calibration_dryrun`` (f511e49) but that the app.py audit (3ab856b)
+    missed: the WS async generator returned by ``client.stream_market`` was
+    captured to a local but never explicitly ``aclose()``d. On graceful
+    shutdown (``stop_event.set()`` → ``break`` out of ``async for``), the
+    connection was left to GC — on the 72 h paper-soak this leaves CLOB
+    WS sockets half-open and delays clean process exit.
+
+    The fix wraps the ``async for`` in ``try/finally`` and calls
+    ``await stream.aclose()`` on every exit path. This test pins the
+    contract: ``mock.stream.aclose_called`` must be ``True`` after a
+    stop_event shutdown.
+    """
+    events = _quiet_balanced_stream(tick_count=3, step_sec=0.3)
+    mock = _AcloseTrackingClient(events)
+    ledger = Ledger.in_memory()
+    stop_event = asyncio.Event()
+
+    task = asyncio.create_task(run(
+        _run_args(max_runtime_sec=5.0),
+        client=mock, ledger=ledger, stop_event=stop_event,
+    ))
+
+    # Let the ingest_loop enter the async for over our tracking stream.
+    await asyncio.sleep(0.5)
+    assert mock.stream is not None, "stream_market was not called"
+
+    # Simulate SIGINT → graceful shutdown path.
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert task.exception() is None
+    assert mock.stream.aclose_called, (
+        "ingest_loop must explicitly aclose() the WS stream on shutdown; "
+        "relying on GC leaves the CLOB connection half-open"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingest_loop_acloses_stream_on_exception() -> None:
+    """Companion to the shutdown-path regression: when the stream *itself*
+    raises (network flake, auth expiry, etc.), ``finally`` must still
+    ``aclose()``. We can't easily trigger an exception from a scripted
+    ``__anext__`` without racing app.run()'s own exception handling, so we
+    exercise the same code path by letting the scripted events end and
+    having ``__anext__`` raise ``RuntimeError`` instead of parking.
+    """
+
+    class _RaisingStream(_AcloseTrackingStream):
+        async def __anext__(self) -> BookSnap | TradeTick:
+            if self._events:
+                scripted = self._events.pop(0)
+                if scripted.delay_sec > 0:
+                    await asyncio.sleep(scripted.delay_sec)
+                return scripted.event
+            raise RuntimeError("simulated WS failure")
+
+    class _RaisingClient(_AcloseTrackingClient):
+        def stream_market(  # type: ignore[override]
+            self, token_ids: list[str] | tuple[str, ...], **kw: Any,
+        ) -> _RaisingStream:
+            wanted = set(token_ids)
+            filtered = [e for e in self._events if e.event.token_id in wanted]
+            self.stream = _RaisingStream(filtered)
+            return self.stream
+
+    events = _quiet_balanced_stream(tick_count=2, step_sec=0.2)
+    mock = _RaisingClient(events)
+    ledger = Ledger.in_memory()
+    stop_event = asyncio.Event()
+
+    task = asyncio.create_task(run(
+        _run_args(max_runtime_sec=5.0),
+        client=mock, ledger=ledger, stop_event=stop_event,
+    ))
+
+    # The ingest task will raise once the scripted events exhaust; _wait_for_stop
+    # logs-and-drops the exception and proceeds to the finally / cleanup.
+    # Give it a moment to unwind, then stop the rest of the graph.
+    await asyncio.sleep(1.0)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert mock.stream is not None
+    assert mock.stream.aclose_called, (
+        "ingest_loop's finally must call aclose() even when the stream raises"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (7) Config error messages include the YAML path
 # ---------------------------------------------------------------------------
 
 

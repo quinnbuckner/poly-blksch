@@ -312,29 +312,46 @@ async def ingest_loop(
     stop_event: asyncio.Event,
 ) -> None:
     """One WS subscription, dispatched per-token. Exits cleanly on
-    stop_event (the underlying WS async-iterator unwinds on cancellation)."""
+    stop_event (the underlying WS async-iterator unwinds on cancellation).
+
+    The async generator returned by ``client.stream_market`` is captured to a
+    local and explicitly ``aclose()``d in a ``finally`` block on every exit
+    path — normal shutdown via ``stop_event``, cancellation, or exception.
+    Relying on GC for an async-WS generator leaves the CLOB connection
+    half-open and delays clean process shutdown on the 72 h paper-soak;
+    deterministic aclose closes it promptly. ``aclose`` errors are swallowed
+    to ``logger.debug`` so they never mask the original exception.
+    """
     stream = client.stream_market(list(token_ids))
     try:
-        async for event in stream:
-            if stop_event.is_set():
-                break
-            tid = event.token_id
-            state = states.get(tid)
-            chain = filters.get(tid)
-            if state is None or chain is None:
-                continue
+        try:
+            async for event in stream:
+                if stop_event.is_set():
+                    break
+                tid = event.token_id
+                state = states.get(tid)
+                chain = filters.get(tid)
+                if state is None or chain is None:
+                    continue
+                try:
+                    if isinstance(event, BookSnap):
+                        await _on_book(event, state, chain, paper_engine, dashboard_ctx)
+                    elif isinstance(event, TradeTick):
+                        await _on_trade(event, state, paper_engine, dashboard_ctx)
+                except Exception:
+                    logger.exception("ingest tick handler crashed for %s", tid)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ingest loop crashed")
+            raise
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
             try:
-                if isinstance(event, BookSnap):
-                    await _on_book(event, state, chain, paper_engine, dashboard_ctx)
-                elif isinstance(event, TradeTick):
-                    await _on_trade(event, state, paper_engine, dashboard_ctx)
-            except Exception:
-                logger.exception("ingest tick handler crashed for %s", tid)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("ingest loop crashed")
-        raise
+                await aclose()
+            except Exception:  # noqa: BLE001 — cleanup must never mask the original
+                logger.debug("stream aclose raised", exc_info=True)
 
 
 async def _on_book(
