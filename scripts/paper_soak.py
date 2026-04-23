@@ -359,6 +359,11 @@ class SoakConfig:
     app_cmd: list[str] = field(default_factory=lambda: [sys.executable, "-m", "blksch.app", "--mode=paper"])
     token_id: str | None = None
     extra_app_args: list[str] = field(default_factory=list)
+    consecutive_sampler_failure_error_threshold: int = 12
+    """How many consecutive sampler exceptions before we escalate to
+    ``log.error`` with a ``DASHBOARD UNREACHABLE`` banner. Default 12 ≈ 1
+    minute at the default 5 s ``sample_interval_sec``. Tune via CLI for
+    tests."""
 
     def resolved_cmd(self) -> list[str]:
         cmd = list(self.app_cmd)
@@ -373,15 +378,33 @@ class SoakConfig:
         return cmd
 
 
-def _spawn_app(cmd: list[str]) -> subprocess.Popen:
+def _spawn_app(cmd: list[str], out_dir: Path) -> subprocess.Popen:
+    """Spawn the bot subprocess; redirect stdout/stderr to ``out_dir/child.log``.
+
+    The previous implementation used ``stdout=subprocess.PIPE`` and never
+    drained the pipe. The macOS pipe buffer is ~64 KB; over 72 h of
+    normal child logging the buffer fills and the child blocks on its
+    next ``write()`` — a silent supervisor hang the operator can only
+    diagnose by attaching with ``lsof``. Routing to a line-buffered file
+    in ``out_dir`` both eliminates the deadlock and preserves child
+    diagnostics for postmortem (especially crashes that happen before
+    the dashboard binds — see :func:`run_soak`'s sampler-escalation
+    path). The file handle is attached to the Popen so
+    :func:`_shutdown_child` can close it deterministically.
+    """
     log.info("Spawning child: %s", " ".join(cmd))
-    return subprocess.Popen(
+    log_path = out_dir / "child.log"
+    log_file = open(log_path, "w", buffering=1)
+    log.info("child stdout/stderr → %s", log_path)
+    proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
         start_new_session=True,
         text=True,
     )
+    proc._child_log_file = log_file  # type: ignore[attr-defined]
+    return proc
 
 
 async def run_soak(
@@ -401,7 +424,7 @@ async def run_soak(
     deadline_sec = cfg.hours * 3600.0
 
     cmd = cfg.resolved_cmd()
-    proc = _spawn_app(cmd)
+    proc = _spawn_app(cmd, cfg.out_dir)
 
     reports: list[HourlyReport] = []
     hour_start = clock()
@@ -416,6 +439,8 @@ async def run_soak(
     last_fills = 0
     last_realized = 0.0
     last_fees = 0.0
+    consecutive_sampler_failures = 0
+    escalated_unreachable = False
 
     try:
         while clock() - hour_start + (len(reports) * 3600.0) < deadline_sec:
@@ -430,12 +455,54 @@ async def run_soak(
                     snap = await sample_fn(cfg.dashboard_url)
                     aggregate.observe(snap)
                     engine = snap.get("engine") or {}
-                    last_fills = int(engine.get("fills_count") or last_fills)
+                    # Use explicit ``is not None`` rather than ``or last_*``
+                    # — a legitimate observation of 0/0.0 (engine reset,
+                    # halt-and-restart) must replace the prior value, not
+                    # carry the stale one forward into the next hour's
+                    # baseline. ``last_*`` values seed the next hour's
+                    # ``HourlyAggregate(*_at_start=...)`` so a stale
+                    # carry-over corrupts that hour's per-hour deltas.
+                    fills_v = engine.get("fills_count")
+                    if fills_v is not None:
+                        last_fills = int(fills_v)
                     pnl = snap.get("pnl") or {}
-                    last_realized = float(pnl.get("realized_usd") or last_realized)
-                    last_fees = float(pnl.get("fees_usd") or last_fees)
+                    real_v = pnl.get("realized_usd")
+                    if real_v is not None:
+                        last_realized = float(real_v)
+                    fees_v = pnl.get("fees_usd")
+                    if fees_v is not None:
+                        last_fees = float(fees_v)
+                    if consecutive_sampler_failures > 0:
+                        log.info(
+                            "sampler recovered after %d consecutive failure(s)",
+                            consecutive_sampler_failures,
+                        )
+                    consecutive_sampler_failures = 0
+                    escalated_unreachable = False
                 except Exception as exc:
-                    log.warning("sampler error: %s", exc)
+                    consecutive_sampler_failures += 1
+                    threshold = cfg.consecutive_sampler_failure_error_threshold
+                    if (
+                        not escalated_unreachable
+                        and consecutive_sampler_failures >= threshold
+                    ):
+                        log.error(
+                            "DASHBOARD UNREACHABLE — %d consecutive sampler "
+                            "failures (latest: %s); child pid=%d alive=%s; "
+                            "url=%s; check %s for child diagnostics.",
+                            consecutive_sampler_failures,
+                            exc,
+                            proc.pid,
+                            proc.poll() is None,
+                            cfg.dashboard_url,
+                            cfg.out_dir / "child.log",
+                        )
+                        escalated_unreachable = True
+                    else:
+                        log.warning(
+                            "sampler error (consecutive=%d): %s",
+                            consecutive_sampler_failures, exc,
+                        )
                 await asyncio.sleep(cfg.sample_interval_sec)
 
             # Close the hour, write report.
@@ -488,19 +555,29 @@ def _write_final(
 
 
 def _shutdown_child(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    log.info("shutting down child pid=%d", proc.pid)
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        proc.wait(timeout=5)
+        if proc.poll() is None:
+            log.info("shutting down child pid=%d", proc.pid)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+    finally:
+        # Close the child-log file we attached in :func:`_spawn_app`.
+        # ``getattr`` keeps this safe for tests that inject a ``_FakeProc``
+        # without the attribute. Suppress any close error so it can never
+        # mask the original exception that may have triggered shutdown.
+        log_file = getattr(proc, "_child_log_file", None)
+        if log_file is not None:
+            with contextlib.suppress(Exception):
+                log_file.close()
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +615,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-pnl-attribution-residual-usd", type=float, default=0.5)
     parser.add_argument("--max-unexpected-kill-switch-events", type=int, default=0)
     parser.add_argument("--min-realized-edge-per-fill-usd", type=float, default=0.0)
+    parser.add_argument(
+        "--consecutive-sampler-failure-error-threshold", type=int, default=12,
+        help=(
+            "How many consecutive sampler exceptions before escalating to "
+            "log.error with 'DASHBOARD UNREACHABLE' (default 12 ≈ 1 min at "
+            "5s sample interval)."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -552,6 +637,9 @@ def main(argv: list[str] | None = None) -> int:
         sample_interval_sec=args.sample_interval_sec,
         out_dir=args.out,
         token_id=args.token_id,
+        consecutive_sampler_failure_error_threshold=(
+            args.consecutive_sampler_failure_error_threshold
+        ),
     )
     if args.app_cmd:
         cfg.app_cmd = args.app_cmd.split()
