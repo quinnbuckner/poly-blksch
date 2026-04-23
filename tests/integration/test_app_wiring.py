@@ -310,3 +310,103 @@ async def test_live_mode_requires_live_ack(tmp_path: Path) -> None:
     )
     with pytest.raises(SystemExit):
         await run(args, client=MockPolyClient([]), ledger=Ledger.in_memory())
+
+
+# ---------------------------------------------------------------------------
+# (5) Ownership contract — externally-provided ledger survives cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_ledger_is_not_closed_by_cleanup() -> None:
+    """Regression for the early-exit cleanup path: when a test (or any
+    outer caller) passes its own ``Ledger``, ``run()`` must NOT close it
+    on any exit path — clean shutdown, screener failure, or empty-tokens
+    early return. The ledger must stay readable afterwards.
+
+    We trip the "empty tokens" early-exit path by passing an empty
+    ``tokens`` list.  Any other exit path exercises the same
+    ``_cleanup(client if owned_client else None, ledger if owned_ledger
+    else None)`` contract.
+    """
+    ledger = Ledger.in_memory()
+
+    args = RunArgs(
+        mode="paper",
+        config_path=BOT_YAML,
+        markets_path=MARKETS_YAML,
+        log_level="WARNING",
+        tokens=[],  # empty — triggers the early-exit cleanup branch
+        rich_dashboard="off",
+    )
+
+    await run(args, client=MockPolyClient([]), ledger=ledger, stop_event=asyncio.Event())
+
+    # Ledger must still be usable — if app.run wrongly closed it we'd get
+    # sqlite3.ProgrammingError("Cannot operate on a closed database.").
+    snap = ledger.pnl()
+    assert snap.realized_usd == 0.0
+    assert snap.unrealized_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_screener_failure_does_not_close_injected_ledger() -> None:
+    """Bug #1 regression: screener failure used to leak owned resources or
+    close the injected ledger. The fix routes through `_cleanup` with
+    None for non-owned resources; the injected ledger must be intact and
+    the exception must propagate to the caller so the operator sees it.
+    """
+
+    class RaisingClient(MockPolyClient):
+        async def list_markets(self, **kw):  # type: ignore[override]
+            raise RuntimeError("simulated screener failure")
+
+    ledger = Ledger.in_memory()
+    args = RunArgs(
+        mode="paper",
+        config_path=BOT_YAML,
+        markets_path=MARKETS_YAML,
+        log_level="WARNING",
+        tokens=None,  # force screener path
+        rich_dashboard="off",
+    )
+
+    with pytest.raises(RuntimeError, match="simulated screener failure"):
+        await run(args, client=RaisingClient([]), ledger=ledger, stop_event=asyncio.Event())
+
+    # Injected ledger must survive the failure path.
+    snap = ledger.pnl()
+    assert snap.realized_usd == 0.0
+    assert snap.unrealized_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
+# (6) Config error messages include the YAML path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_config_key_reports_dotted_path(tmp_path: Path) -> None:
+    """Bug #3 regression: missing nested keys in bot.yaml used to raise bare
+    ``KeyError`` with no location context. Each access now goes through
+    ``_require()`` and raises a ``RuntimeError`` that names the full
+    dotted path."""
+    bad_yaml = tmp_path / "bot.yaml"
+    bad_yaml.write_text(
+        # Valid top-level keys + malformed quoting subtree (missing `gamma`).
+        "quoting:\n  k: 1.5\n"
+        "boundary:\n  eps: 1.0e-5\n  delta_p_floor_ticks: 1\n"
+        "loop:\n  refresh_ms: 250\n"
+        "calibration: {}\n"
+        "limits: {}\n"
+    )
+    args = RunArgs(
+        mode="paper",
+        config_path=bad_yaml,
+        markets_path=MARKETS_YAML,
+        log_level="WARNING",
+        tokens=[TOKEN],
+        rich_dashboard="off",
+    )
+    with pytest.raises(RuntimeError, match=r"bot\.quoting\.gamma"):
+        await run(args, client=MockPolyClient([]), ledger=Ledger.in_memory())

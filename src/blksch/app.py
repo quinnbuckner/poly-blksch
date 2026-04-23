@@ -206,11 +206,13 @@ def load_app_config(bot_yaml: Path, markets_yaml: Path) -> AppConfig:
     app_extra = bot.get("app", {}) if isinstance(bot.get("app"), dict) else {}
 
     quote_params = QuoteParams(
-        gamma=float(q["gamma"]),
-        k=float(q["k"]),
-        eps=float(bnd["eps"]),
+        gamma=float(_require(q, "gamma", "bot.quoting.gamma")),
+        k=float(_require(q, "k", "bot.quoting.k")),
+        eps=float(_require(bnd, "eps", "bot.boundary.eps")),
         # delta_p_floor_ticks × tick_size (Polymarket tick = 0.01).
-        delta_p_floor=float(bnd["delta_p_floor_ticks"]) * 0.01,
+        delta_p_floor=float(
+            _require(bnd, "delta_p_floor_ticks", "bot.boundary.delta_p_floor_ticks")
+        ) * 0.01,
         q_max_base=float(inv.get("q_max_notional_usd", 50.0)),
         q_max_shrink=float(inv.get("q_max_shrink_factor", 1.0)),
     )
@@ -282,6 +284,16 @@ def _require_keys(cfg: dict[str, Any], keys: Iterable[str]) -> None:
     missing = [k for k in keys if k not in cfg]
     if missing:
         raise SystemExit(f"config missing required top-level keys: {missing}")
+
+
+def _require(d: dict[str, Any], key: str, path: str) -> Any:
+    """Dict access with a path-qualified error message. Uses the full dotted
+    path (``bot.quoting.gamma``) so operators don't have to reverse-engineer
+    which YAML section is missing from a bare ``KeyError('gamma')``."""
+    try:
+        return d[key]
+    except (KeyError, TypeError) as e:
+        raise RuntimeError(f"config missing key: {path}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -599,21 +611,37 @@ async def run(
         )
         owned_ledger = True
 
-    # Token selection: explicit list or screener.
+    # Token selection: explicit list or screener. The screener call touches
+    # the network and can raise; route any failure through the early-exit
+    # cleanup so owned resources are released and externally-injected ones
+    # stay live (see _cleanup's ownership contract).
     if args.tokens:
         token_ids = list(args.tokens)
         logger.info("using explicit tokens: %s", token_ids)
     else:
-        screener = Screener(
-            client=client, filters=cfg.screener_filters, pair_hints=cfg.pair_hints,
-        )
-        screen = await screener.screen()
-        token_ids = list(screen.token_ids)
-        logger.info("screener selected %d tokens: %s", len(token_ids), token_ids)
+        try:
+            screener = Screener(
+                client=client, filters=cfg.screener_filters,
+                pair_hints=cfg.pair_hints,
+            )
+            screen = await screener.screen()
+            token_ids = list(screen.token_ids)
+            logger.info("screener selected %d tokens: %s",
+                        len(token_ids), token_ids)
+        except Exception:
+            logger.exception("screener failed — aborting startup")
+            await _cleanup(
+                client if owned_client else None,
+                ledger if owned_ledger else None,
+            )
+            raise
 
     if not token_ids:
         logger.error("no tokens to quote — check screener filters or pass --tokens")
-        await _cleanup(client if owned_client else None, ledger)
+        await _cleanup(
+            client if owned_client else None,
+            ledger if owned_ledger else None,
+        )
         return
 
     # Per-token state + filter chains.
@@ -827,16 +855,26 @@ def _maybe_start_rich_dashboard(
 # ---------------------------------------------------------------------------
 
 
-async def _cleanup(client: PolyClient | None, ledger: Ledger) -> None:
+async def _cleanup(client: PolyClient | None, ledger: Ledger | None) -> None:
+    """Best-effort shutdown for the early-exit paths.
+
+    Ownership contract: callers pass only the resources that ``run()``
+    constructed (owned_client / owned_ledger). A ``None`` argument means
+    the resource is externally provided and must NOT be closed — closing
+    an injected ledger or client would break tests that inspect the
+    ledger after run() returns and would double-close a caller-managed
+    resource in production.
+    """
     if client is not None:
         try:
             await client.close()
         except Exception:
             pass
-    try:
-        ledger.close()
-    except Exception:
-        pass
+    if ledger is not None:
+        try:
+            ledger.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":  # pragma: no cover
