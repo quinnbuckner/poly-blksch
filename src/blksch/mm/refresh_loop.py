@@ -212,6 +212,16 @@ class RefreshLoop:
         """One full pass through steps 1-6 for a single token.
 
         Returns the Quote that was emitted, or None if the cycle pulled/paused.
+
+        Sticky-pause contract: once ``state.limits.paused`` is True, every
+        subsequent cycle returns None and emits neither a Quote to the
+        ``quote_sink`` nor (after the trip cycle) a pull to the
+        ``pull_sink``, until the operator calls ``state.limits.resume()``.
+        Previously this method gated on ``report.tripped`` — i.e. whether
+        any condition fired *this* cycle — so on feed-gap recovery it
+        happily resumed quoting even though the sticky PaperEngine still
+        rejected every order, flooding the soak log with one
+        ``place_order rejected (halted)`` warning per 250 ms cycle.
         """
         state = self.state(token_id)
         now = self._clock()
@@ -220,12 +230,19 @@ class RefreshLoop:
         snap = await self.data_feed(token_id)
         if snap is None:
             # No data at all — treat as feed gap for purposes of kill-switch.
+            # Snapshot pause_reasons pre-evaluate so we can tell "tripped
+            # this cycle" from "sticky continuation" after evaluate mutates
+            # the persistent set.
+            pre_reasons = frozenset(state.limits.pause_reasons)
             report = state.limits.evaluate(
                 now=now, current_sigma=None,
                 cumulative_pnl_usd=self._pnl(token_id),
             )
-            if report.tripped:
-                await self._emit_pull(token_id, ",".join(report.reasons))
+            if state.limits.paused:
+                new_reasons = tuple(r for r in report.reasons if r not in pre_reasons)
+                await self._handle_pause(
+                    token_id, new_reasons, state.limits.pause_reasons,
+                )
             return None
 
         # Update running state
@@ -236,6 +253,7 @@ class RefreshLoop:
         # --- Kill-switch evaluation (step 1 continued) ----------------------
         current_qty = snap.position.qty if snap.position else 0.0
         current_p = snap.book.mid if snap.book else None
+        pre_reasons = frozenset(state.limits.pause_reasons)
         report = state.limits.evaluate(
             now=now,
             current_sigma=snap.surface.sigma_b,
@@ -243,9 +261,9 @@ class RefreshLoop:
             current_qty=current_qty,
             current_p=current_p,
         )
-        if report.tripped:
-            logger.warning("kill-switch tripped %s: %s", token_id, report.reasons)
-            await self._emit_pull(token_id, ",".join(report.reasons))
+        if state.limits.paused:
+            new_reasons = tuple(r for r in report.reasons if r not in pre_reasons)
+            await self._handle_pause(token_id, new_reasons, state.limits.pause_reasons)
             return None
 
         # --- Step 3: guards (decide before sizing so we can pull cheaply) ----
@@ -408,6 +426,45 @@ class RefreshLoop:
         except Exception:
             logger.exception(
                 "hedge_sink failed for calendar %s", instruction.source_token_id
+            )
+
+    async def _handle_pause(
+        self,
+        token_id: str,
+        new_reasons: tuple[str, ...],
+        pause_reasons: tuple[str, ...],
+    ) -> None:
+        """Log and pull on a paused cycle.
+
+        Fires a WARN + emits a pull on the cycle where any ``new_reasons``
+        arrived (fresh trips the operator hasn't seen before). Stays quiet
+        at DEBUG on every subsequent sticky-continuation cycle and does
+        NOT re-emit a pull — re-hammering the router with ``cancel_all``
+        every 250 ms for the duration of a halt would generate ~1M
+        informational log lines over a 72 h soak and is unnecessary
+        because the first pull cancelled all resting orders and the
+        halted PaperEngine / OrderRouter reject any order that slips
+        through by other means.
+
+        ``new_reasons`` is computed by the caller as
+        ``report.reasons - pre_evaluate_pause_reasons`` — keeping that
+        diff in the caller (rather than on the report dataclass) keeps
+        ``KillSwitchReport``'s shape stable for snapshot regression
+        coverage owned by Track C.
+        """
+        if new_reasons:
+            logger.warning(
+                "kill-switch tripped %s: new=%s all_active=%s",
+                token_id,
+                list(new_reasons),
+                list(pause_reasons),
+            )
+            await self._emit_pull(token_id, ",".join(pause_reasons))
+        else:
+            logger.debug(
+                "kill-switch still active %s: %s",
+                token_id,
+                list(pause_reasons),
             )
 
     async def _emit_pull(self, token_id: str, reason: str) -> None:

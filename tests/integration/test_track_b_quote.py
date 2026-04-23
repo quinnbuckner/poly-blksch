@@ -376,3 +376,139 @@ class TestRefreshLoop:
         result = await loop.run_once(TOK)
         assert result is None
         assert any("inventory_cap" in r for _, r in collector.pulls)
+
+    @pytest.mark.asyncio
+    async def test_refresh_loop_skips_quotes_while_paused(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Regression for the kill-switch sticky-pause contract.
+
+        Before the fix: trip feed_gap → pull; next cycle with a fresh tick
+        sees ``report.tripped == False`` (the current cycle's reasons are
+        now empty because the gap resolved) → refresh_loop happily
+        resumes quoting; the router forwards each quote to the
+        paper_engine, which is still sticky-halted and rejects every
+        order with a ``place_order rejected (halted)`` WARN per 250 ms
+        cycle — hundreds of thousands of log lines over the 72 h soak.
+
+        After the fix: refresh_loop gates on ``state.limits.paused``,
+        which stays True until ``resume()`` is called. Post-trip clean
+        cycles produce no Quotes, no additional ``kill-switch tripped``
+        WARNs, and no pull-sink hammering. Assertions below pin each.
+
+        We trip feed_gap via a stale-timestamp snap (not via ``snap=None``)
+        so both the old and new code paths run through the snap-available
+        branch where both versions log WARN on a fresh trip — that
+        isolates the sticky-vs-not-sticky semantic under test from the
+        snap=None log-path difference.
+        """
+        import logging
+        caplog.set_level(logging.DEBUG, logger="blksch.mm.refresh_loop")
+        collector = _Collector()
+        now_holder = [0.0]
+        snap_ts_holder = [0.0]
+
+        async def feed(token_id: str) -> MarketSnapshot | None:
+            # Snap always returns; its logit_state.ts is whatever
+            # ``snap_ts_holder`` says. By holding ts fixed while
+            # advancing the clock we synthesize a feed gap; by moving
+            # ts forward we simulate the operator's data recovering.
+            return MarketSnapshot(
+                token_id=TOK,
+                logit_state=_logit(0.0, sec=snap_ts_holder[0]),
+                surface=_surface(0.3, sec=snap_ts_holder[0]),
+                position=_position(0.0),
+                book=_book(0.5, sec=snap_ts_holder[0]),
+                trades=(),
+                time_to_horizon_sec=1000.0,
+            )
+
+        loop = RefreshLoop(
+            config=LoopConfig(
+                refresh_ms=10,
+                quote=QuoteParams(gamma=0.1, k=1.5, delta_p_floor=0.001),
+                limits=LimitsConfig(feed_gap_sec=1.0),
+            ),
+            data_feed=feed,
+            quote_sink=collector.quote_sink,
+            pull_sink=collector.pull_sink,
+            clock=lambda: _ts(now_holder[0]),
+        )
+        loop.add_token(TOK)
+
+        # Cycle 1 (t=0, snap ts=0): clean quote emitted.
+        now_holder[0] = 0.0
+        snap_ts_holder[0] = 0.0
+        q0 = await loop.run_once(TOK)
+        assert q0 is not None
+        assert len(collector.quotes) == 1
+        pre_trip_pulls = len(collector.pulls)
+
+        # Cycle 2 (t=5, snap ts still 0): 5 s gap > 1 s threshold → trip.
+        now_holder[0] = 5.0
+        q1 = await loop.run_once(TOK)
+        assert q1 is None
+        assert loop.state(TOK).limits.paused
+        assert "feed_gap" in loop.state(TOK).limits.pause_reasons
+        # The trip cycle emits exactly one pull.
+        assert len(collector.pulls) == pre_trip_pulls + 1
+        trip_pull_count = len(collector.pulls)
+        # Exactly one "kill-switch tripped" WARN for the trip cycle.
+        warn_trips = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and "kill-switch tripped" in rec.getMessage()
+        ]
+        assert len(warn_trips) == 1, (
+            f"expected 1 WARN on trip cycle, got {len(warn_trips)}"
+        )
+
+        # Cycles 3-7 (5 clean cycles): data recovers — snap ts advances
+        # with now. The current-cycle feed_gap is back under threshold,
+        # so OLD behavior would re-emit quotes. Sticky pause guarantees
+        # we don't.
+        pre_sticky_quote_count = len(collector.quotes)
+        for i in range(5):
+            now_holder[0] = 6.0 + i * 0.5
+            snap_ts_holder[0] = now_holder[0]
+            result = await loop.run_once(TOK)
+            assert result is None, f"cycle {i}: must stay paused"
+
+        assert len(collector.quotes) == pre_sticky_quote_count, (
+            f"refresh_loop emitted {len(collector.quotes) - pre_sticky_quote_count} "
+            f"extra Quote(s) while paused — sticky contract broken"
+        )
+        assert len(collector.pulls) == trip_pull_count, (
+            f"refresh_loop hammered pull_sink {len(collector.pulls) - trip_pull_count} "
+            f"extra times while paused; once per halt is enough"
+        )
+        # Still exactly one "kill-switch tripped" WARN overall.
+        warn_trips_after = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and "kill-switch tripped" in rec.getMessage()
+        ]
+        assert len(warn_trips_after) == 1, (
+            f"expected still 1 WARN after 5 sticky cycles, got "
+            f"{len(warn_trips_after)} — log spam guard broken"
+        )
+        # Sticky cycles should log at DEBUG — verify the path is exercised.
+        debug_stickies = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.DEBUG
+            and "kill-switch still active" in rec.getMessage()
+        ]
+        assert len(debug_stickies) == 5, (
+            f"expected 5 DEBUG sticky-continuation lines, got {len(debug_stickies)}"
+        )
+
+        # After explicit resume(), refresh_loop quotes again.
+        loop.state(TOK).limits.resume(reason="test: simulated operator clear")
+        now_holder[0] = 10.0
+        snap_ts_holder[0] = 10.0
+        q_post_resume = await loop.run_once(TOK)
+        assert q_post_resume is not None, (
+            "post-resume cycle should quote normally"
+        )
+        assert not loop.state(TOK).limits.paused
+        assert loop.state(TOK).limits.pause_reasons == ()
