@@ -24,13 +24,14 @@ from SQLite row shapes.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Literal, Mapping
 
 from blksch.schemas import (
     Fill,
@@ -434,3 +435,202 @@ def reconcile(fills: Iterable[Fill], mark: float) -> PnLSnapshot:
         fees += f.fee_usd
     unrealized = qty * (mark - avg) if qty != 0 else 0.0
     return PnLSnapshot(realized_usd=realized, unrealized_usd=unrealized, fees_usd=fees)
+
+
+# ---------------------------------------------------------------------------
+# Ledger-drift detection — Stage-2 "ledger drifted from venue" kill switch
+# ---------------------------------------------------------------------------
+
+
+DiscrepancyKind = Literal[
+    "pnl_drift",             # positions table disagrees with a fills-table replay
+    "qty_drift",             # positions.qty disagrees with replay
+    "duplicate_client_id",   # same client_id appears >1 time in fills
+    "venue_missing",         # ledger has a fill the venue doesn't know about
+    "ledger_missing",        # venue has a fill the ledger doesn't know about
+    "field_mismatch",        # same client_id, different price / size / side
+]
+
+
+@dataclass(frozen=True)
+class ReconciliationDiscrepancy:
+    kind: DiscrepancyKind
+    token_id: str
+    detail: str
+    expected: Any = None
+    observed: Any = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d = dataclasses.asdict(self)
+        # Fills aren't JSON-friendly; stringify.
+        for k in ("expected", "observed"):
+            v = d.get(k)
+            if hasattr(v, "model_dump"):
+                d[k] = v.model_dump(mode="json")
+            elif isinstance(v, (int, float, str, bool)) or v is None:
+                pass
+            else:
+                d[k] = str(v)
+        return d
+
+
+@dataclass
+class ReconciliationReport:
+    passed: bool
+    tokens_checked: list[str] = field(default_factory=list)
+    discrepancies: list[ReconciliationDiscrepancy] = field(default_factory=list)
+
+    def by_kind(self, kind: DiscrepancyKind) -> list[ReconciliationDiscrepancy]:
+        return [d for d in self.discrepancies if d.kind == kind]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "passed": self.passed,
+            "tokens_checked": list(self.tokens_checked),
+            "discrepancies": [d.to_dict() for d in self.discrepancies],
+        }
+
+
+def reconcile_against_ledger(
+    ledger: "Ledger",
+    *,
+    tolerance_usd: float = 1e-6,
+    qty_tolerance: float = 1e-9,
+    venue_fills: Mapping[str, Iterable[Fill]] | None = None,
+) -> ReconciliationReport:
+    """Cross-check the ledger's stored state against a replay of its fill
+    history, and (optionally) against an exchange-supplied record.
+
+    The ledger maintains two parallel truths:
+
+    * ``positions`` — incrementally updated by :meth:`Ledger.apply_fill`
+      on every fill that crosses.
+    * ``fills`` — the raw append log of every fill the router saw.
+
+    If ``apply_fill`` is bypassed, or a fill row is edited in place, or a
+    row is inserted twice, those two tables drift. This function replays
+    the fills log from scratch via :func:`reconcile` and compares the result
+    to ``positions``.
+
+    If ``venue_fills`` is supplied (a mapping ``token_id -> iterable[Fill]``
+    from the exchange's authoritative record, typically via ``GET /trades``),
+    the function also flags per-client-id asymmetries: fills present on one
+    side but not the other, and same-cid fills that differ in price / size /
+    side.
+
+    Any non-empty ``discrepancies`` list should trip a kill switch in the
+    operator runbook — the ledger has drifted from venue truth and Stage-2
+    live trading must pause until the mismatch is investigated.
+    """
+    discrepancies: list[ReconciliationDiscrepancy] = []
+
+    # Gather every token we need to check — union of positions and fills
+    # tables, plus any token only present in the venue feed.
+    with ledger._lock:
+        pos_tokens = {r[0] for r in ledger._conn.execute(
+            "SELECT token_id FROM positions"
+        ).fetchall()}
+        fill_tokens = {r[0] for r in ledger._conn.execute(
+            "SELECT DISTINCT token_id FROM fills"
+        ).fetchall()}
+    tokens = pos_tokens | fill_tokens | set(venue_fills or ())
+
+    for tok in sorted(tokens):
+        ledger_fills = ledger.fills(tok)
+
+        # Duplicate client_id detection.
+        seen: dict[str, int] = {}
+        for f in ledger_fills:
+            seen[f.order_client_id] = seen.get(f.order_client_id, 0) + 1
+        for cid, n in seen.items():
+            if n > 1:
+                discrepancies.append(ReconciliationDiscrepancy(
+                    kind="duplicate_client_id",
+                    token_id=tok,
+                    detail=f"client_id={cid} appears {n} time(s) in fills",
+                    expected=1, observed=n,
+                ))
+
+        # Replay vs stored position/realized.
+        pos = ledger.get_position(tok)
+        replayed = reconcile(ledger_fills, pos.mark)
+        if abs(pos.realized_pnl_usd - replayed.realized_usd) > tolerance_usd:
+            discrepancies.append(ReconciliationDiscrepancy(
+                kind="pnl_drift",
+                token_id=tok,
+                detail=(
+                    f"realized PnL: stored ${pos.realized_pnl_usd:.6f} vs "
+                    f"replay ${replayed.realized_usd:.6f} "
+                    f"(delta ${pos.realized_pnl_usd - replayed.realized_usd:+.6f})"
+                ),
+                expected=replayed.realized_usd,
+                observed=pos.realized_pnl_usd,
+            ))
+
+        # Replay also gives us a qty — compare to stored qty directly.
+        replay_qty = _replay_qty(ledger_fills)
+        if abs(pos.qty - replay_qty) > qty_tolerance:
+            discrepancies.append(ReconciliationDiscrepancy(
+                kind="qty_drift",
+                token_id=tok,
+                detail=(
+                    f"qty: stored {pos.qty:+.6f} vs replay {replay_qty:+.6f} "
+                    f"(delta {pos.qty - replay_qty:+.6f})"
+                ),
+                expected=replay_qty,
+                observed=pos.qty,
+            ))
+
+        # Venue comparison (optional).
+        if venue_fills is not None and tok in venue_fills:
+            venue = list(venue_fills[tok])
+            venue_by_cid = {f.order_client_id: f for f in venue}
+            ledger_by_cid = {f.order_client_id: f for f in ledger_fills}
+            for cid in venue_by_cid.keys() - ledger_by_cid.keys():
+                f = venue_by_cid[cid]
+                discrepancies.append(ReconciliationDiscrepancy(
+                    kind="ledger_missing",
+                    token_id=tok,
+                    detail=f"venue has fill client_id={cid} not in ledger",
+                    expected=f, observed=None,
+                ))
+            for cid in ledger_by_cid.keys() - venue_by_cid.keys():
+                f = ledger_by_cid[cid]
+                discrepancies.append(ReconciliationDiscrepancy(
+                    kind="venue_missing",
+                    token_id=tok,
+                    detail=f"ledger has fill client_id={cid} not in venue",
+                    expected=None, observed=f,
+                ))
+            for cid in venue_by_cid.keys() & ledger_by_cid.keys():
+                v = venue_by_cid[cid]
+                l = ledger_by_cid[cid]
+                if (
+                    abs(v.price - l.price) > 1e-9
+                    or abs(v.size - l.size) > 1e-9
+                    or v.side != l.side
+                ):
+                    discrepancies.append(ReconciliationDiscrepancy(
+                        kind="field_mismatch",
+                        token_id=tok,
+                        detail=(
+                            f"client_id={cid}: "
+                            f"venue {v.side.value} {v.price}x{v.size} "
+                            f"vs ledger {l.side.value} {l.price}x{l.size}"
+                        ),
+                        expected=v, observed=l,
+                    ))
+
+    return ReconciliationReport(
+        passed=len(discrepancies) == 0,
+        tokens_checked=sorted(tokens),
+        discrepancies=discrepancies,
+    )
+
+
+def _replay_qty(fills: Iterable[Fill]) -> float:
+    """Signed-qty replay (no PnL math). Positive = long."""
+    q = 0.0
+    for f in fills:
+        q += f.size if f.side is OrderSide.BUY else -f.size
+    return q

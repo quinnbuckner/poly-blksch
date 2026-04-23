@@ -7,7 +7,14 @@ the builtin in the caller's namespace.
 
 from .clob_client import CLOBConfig, make_clob_client
 from .dashboard import DashboardContext, FlaskDashboard, RichDashboard
-from .ledger import Ledger, PnLSnapshot, reconcile
+from .ledger import (
+    Ledger,
+    PnLSnapshot,
+    ReconciliationDiscrepancy,
+    ReconciliationReport,
+    reconcile,
+    reconcile_against_ledger,
+)
 from .order_router import OrderRouter, RouterConfig
 from .paper_engine import PaperEngine, PaperEngineConfig, PaperEngineState
 
@@ -21,8 +28,11 @@ __all__ = [
     "PaperEngineConfig",
     "PaperEngineState",
     "PnLSnapshot",
+    "ReconciliationDiscrepancy",
+    "ReconciliationReport",
     "RichDashboard",
     "RouterConfig",
     "make_clob_client",
     "reconcile",
+    "reconcile_against_ledger",
 ]
