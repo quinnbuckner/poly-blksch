@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
 import time
 from collections.abc import AsyncIterator, Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiohttp
@@ -36,6 +38,35 @@ DEFAULT_RATE_PER_SEC = 12.0
 DEFAULT_REQUEST_TIMEOUT_S = 10.0
 DEFAULT_POOL_SIZE = 10
 DEFAULT_WS_PING_INTERVAL_S = 30.0
+
+# --- Mock-mode routing ----------------------------------------------------
+#
+# Any token_id matching :data:`MOCK_TOKEN_PREFIXES` is served by
+# :class:`MockPolyClient` instead of Polymarket's live endpoints. This is
+# the convention that lets ``paper_soak.py --token-id 0xmock`` and
+# similar rehearsals run the full pipeline without network I/O.
+#
+# The mock stream is driven by a seeded RNG (env var
+# ``MOCK_POLYCLIENT_SEED``, default 42) so test runs are byte-reproducible.
+
+MOCK_TOKEN_PREFIXES: tuple[str, ...] = ("0xmock", "mock:")
+MOCK_SEED_ENV = "MOCK_POLYCLIENT_SEED"
+MOCK_DEFAULT_SEED = 42
+MOCK_DEFAULT_INTERVAL_S = 0.25
+MOCK_DEFAULT_SIGMA_B = 0.02
+MOCK_DEFAULT_TRADE_PROB = 0.1
+MOCK_DEFAULT_HALF_SPREAD_P = 0.005
+MOCK_DEFAULT_DEPTH = 100.0
+
+
+def is_mock_token(token_id: str) -> bool:
+    """True if ``token_id`` should route through :class:`MockPolyClient`.
+
+    The convention is any id starting with ``0xmock`` or ``mock:`` (case
+    insensitive). Example: ``0xmock``, ``0xmockFOO``, ``mock:btc-70k``.
+    """
+    t = token_id.lower()
+    return any(t.startswith(p) for p in MOCK_TOKEN_PREFIXES)
 
 
 class AsyncRateLimiter:
@@ -227,6 +258,8 @@ class PolyClient:
     # -- REST --------------------------------------------------------------
 
     async def get_book(self, token_id: str) -> BookSnap:
+        if is_mock_token(token_id):
+            return _mock_initial_book(token_id)
         await self._limiter.acquire()
         async with self.session.get(
             self._clob_book_url, params={"token_id": token_id}
@@ -298,10 +331,28 @@ class PolyClient:
 
         If ``reconnect`` is True (default), transient disconnects are retried
         with exponential backoff up to ``reconnect_max_delay_s``.
+
+        Mock routing: if every ``token_id`` satisfies :func:`is_mock_token`,
+        the call is transparently served by :func:`_mock_stream_market` and
+        no network is touched. Mixing mock and real tokens is a
+        ``ValueError`` (multiplexing a live WS with a synthetic stream
+        would give false quote-uptime readings).
         """
         ids = list(token_ids)
         if not ids:
             raise ValueError("token_ids must be non-empty")
+        mock_flags = [is_mock_token(t) for t in ids]
+        if all(mock_flags):
+            async for event in _mock_stream_market(ids):
+                yield event
+            return
+        if any(mock_flags):
+            real = [t for t, m in zip(ids, mock_flags) if not m]
+            mock = [t for t, m in zip(ids, mock_flags) if m]
+            raise ValueError(
+                "Cannot mix mock and real token_ids in a single stream_market "
+                f"call. Mock: {mock!r}; real: {real!r}."
+            )
         books: dict[str, BookSnap] = {}
         backoff = 1.0
         while True:
@@ -381,3 +432,193 @@ def _dispatch_ws_message(
             logger.debug("WS: skipping malformed %s event: %s", etype, exc)
             continue
     return result
+
+
+# ---------------------------------------------------------------------------
+# Mock client — network-free rehearsal / test stream
+# ---------------------------------------------------------------------------
+
+
+def _mock_seed_from_env(override: int | None) -> int:
+    """Resolve the mock seed: explicit override wins, else
+    ``MOCK_POLYCLIENT_SEED`` env var, else :data:`MOCK_DEFAULT_SEED`."""
+    if override is not None:
+        return int(override)
+    raw = os.environ.get(MOCK_SEED_ENV)
+    if raw is None:
+        return MOCK_DEFAULT_SEED
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; falling back to default seed %d",
+            MOCK_SEED_ENV, raw, MOCK_DEFAULT_SEED,
+        )
+        return MOCK_DEFAULT_SEED
+
+
+def _snap_from_logit_mid(
+    token_id: str, x_mid: float, *, half_spread_p: float, depth: float, ts: datetime,
+) -> BookSnap:
+    """Build a :class:`BookSnap` from a logit-space mid.
+
+    Clips ``p`` into ``[half_spread_p, 1 - half_spread_p]`` so that both
+    bid and ask stay in the schema's ``[0, 1]`` band after the spread is
+    taken around the mid.
+    """
+    p = 1.0 / (1.0 + math.exp(-x_mid))
+    # Leave enough room on both sides of the mid for the half-spread.
+    p = max(half_spread_p + 1e-6, min(1.0 - half_spread_p - 1e-6, p))
+    return BookSnap(
+        token_id=token_id,
+        bids=[PriceLevel(price=p - half_spread_p, size=depth)],
+        asks=[PriceLevel(price=p + half_spread_p, size=depth)],
+        ts=ts,
+    )
+
+
+def _mock_initial_book(token_id: str) -> BookSnap:
+    """Return a fresh at-the-money mock book (for ``get_book`` warmup)."""
+    return _snap_from_logit_mid(
+        token_id, 0.0,
+        half_spread_p=MOCK_DEFAULT_HALF_SPREAD_P,
+        depth=MOCK_DEFAULT_DEPTH,
+        ts=datetime.now(UTC),
+    )
+
+
+async def _mock_stream_market(
+    token_ids: Iterable[str],
+    *,
+    seed: int | None = None,
+    interval_s: float = MOCK_DEFAULT_INTERVAL_S,
+    sigma_b: float = MOCK_DEFAULT_SIGMA_B,
+    trade_probability: float = MOCK_DEFAULT_TRADE_PROB,
+    half_spread_p: float = MOCK_DEFAULT_HALF_SPREAD_P,
+    depth: float = MOCK_DEFAULT_DEPTH,
+    start_ts: datetime | None = None,
+) -> AsyncIterator[BookSnap | TradeTick]:
+    """Deterministic network-free stream mirroring the shape of
+    :meth:`PolyClient.stream_market`.
+
+    Each ``token_id`` gets its own drifting logit mid (initial 0.0, i.e.
+    p=0.5) advanced by ``N(0, sigma_b² · interval_s)`` per tick. A book
+    snapshot is yielded every ``interval_s`` seconds per token; a trade
+    tick is yielded with probability ``trade_probability`` per tick.
+
+    Timestamps advance deterministically from ``start_ts`` by
+    ``interval_s`` per full round through ``token_ids``, so identical
+    (seed, start_ts) pairs produce byte-identical event sequences. If
+    ``start_ts`` is ``None`` the stream anchors at ``datetime.now(UTC)``
+    (good for live rehearsals, not deterministic).
+
+    The generator never exits on its own; the caller terminates it by
+    breaking out of the ``async for`` or calling ``aclose``.
+    """
+    ids = list(token_ids)
+    if not ids:
+        raise ValueError("token_ids must be non-empty")
+    import random as _random  # local — keeps mock isolated from real path
+
+    rng = _random.Random(_mock_seed_from_env(seed))
+    step_std = sigma_b * math.sqrt(interval_s)
+    x: dict[str, float] = {tid: 0.0 for tid in ids}
+    anchor = start_ts if start_ts is not None else datetime.now(UTC)
+    tick = 0
+    try:
+        while True:
+            ts = anchor + timedelta(seconds=interval_s * tick)
+            for tid in ids:
+                x[tid] += rng.gauss(0.0, step_std)
+                yield _snap_from_logit_mid(
+                    tid, x[tid],
+                    half_spread_p=half_spread_p, depth=depth, ts=ts,
+                )
+                if rng.random() < trade_probability:
+                    p = 1.0 / (1.0 + math.exp(-x[tid]))
+                    p = max(0.01, min(0.99, p))
+                    side = TradeSide.BUY if rng.random() < 0.5 else TradeSide.SELL
+                    yield TradeTick(
+                        token_id=tid,
+                        price=p,
+                        size=float(rng.uniform(1.0, 10.0)),
+                        aggressor_side=side,
+                        ts=ts,
+                    )
+            tick += 1
+            await asyncio.sleep(interval_s)
+    except asyncio.CancelledError:
+        raise
+
+
+class MockPolyClient(PolyClient):
+    """Network-free :class:`PolyClient` for rehearsals and tests.
+
+    Inherits the real client's interface (``start``, ``close``,
+    ``get_book``, ``stream_market``, ``list_markets``) but skips every
+    aiohttp / websockets call. Use this when you want to GUARANTEE no
+    network is touched — e.g. in unit tests that might otherwise receive
+    a real ``token_id`` by accident.
+
+    For ``paper_soak.py --token-id 0xmock`` rehearsals the real
+    :class:`PolyClient` already routes mock tokens to
+    :func:`_mock_stream_market` transparently; wiring a
+    :class:`MockPolyClient` explicitly is not required at the app layer.
+    """
+
+    def __init__(
+        self,
+        *,
+        seed: int | None = None,
+        interval_s: float = MOCK_DEFAULT_INTERVAL_S,
+        sigma_b: float = MOCK_DEFAULT_SIGMA_B,
+        trade_probability: float = MOCK_DEFAULT_TRADE_PROB,
+        start_ts: datetime | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._mock_seed = _mock_seed_from_env(seed)
+        self._mock_interval_s = interval_s
+        self._mock_sigma_b = sigma_b
+        self._mock_trade_probability = trade_probability
+        self._mock_start_ts = start_ts
+
+    async def start(self) -> None:  # no aiohttp session needed
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def get_book(self, token_id: str) -> BookSnap:
+        return _mock_initial_book(token_id)
+
+    async def get_markets(
+        self, *, limit: int = 100, offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        return []
+
+    async def list_markets(
+        self, *, page_size: int = 100, max_markets: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return []
+
+    async def get_clob_market(self, condition_id: str) -> dict[str, Any]:
+        return {"condition_id": condition_id, "tokens": [], "active": True}
+
+    async def stream_market(
+        self,
+        token_ids: Iterable[str],
+        *,
+        maintain_book_state: bool = True,  # unused (mock has no diffs)
+        reconnect: bool = True,             # unused (mock can't disconnect)
+        reconnect_max_delay_s: float = 30.0,
+    ) -> AsyncIterator[BookSnap | TradeTick]:
+        async for ev in _mock_stream_market(
+            list(token_ids),
+            seed=self._mock_seed,
+            interval_s=self._mock_interval_s,
+            sigma_b=self._mock_sigma_b,
+            trade_probability=self._mock_trade_probability,
+            start_ts=self._mock_start_ts,
+        ):
+            yield ev
