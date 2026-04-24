@@ -26,6 +26,12 @@ data/
 # Test-run artifacts (e.g. gate-sweep-<ts>.json from the §6 replication gate)
 runs/
 
+# Paper-soak harness artifacts
+soak_output/
+
+# Claude Code session scratch
+.claude/
+
 # OS / editor
 .DS_Store
 .idea/

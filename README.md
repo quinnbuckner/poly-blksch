@@ -27,17 +27,32 @@ Paper trading first; live promotion is gated on test results at each stage.
 ```bash
 git clone https://github.com/quinnbuckner/poly-blksch.git
 cd poly-blksch
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-pytest tests/unit -v         # fast sanity check
-python -m blksch.app --mode=paper  # (not wired yet at Day-0)
+python3.14 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev,clob]"
+pytest tests/unit tests/integration tests/contract -q  # expect 1086/15/0
 ```
+
+### Stage-1 operator path
+
+```bash
+# 1. Pre-flight
+lsof -i :5055                                                            # dashboard port free?
+python scripts/live_ro_auth_check.py                                     # live-RO sanity (no .env)
+
+# 2. Pick a market (per-market GO/NO-GO)
+python scripts/calibration_dryrun.py --auto --minutes 15 --out ./runs/dryrun-1/
+
+# 3. 72h paper-soak (Stage-1 acceptance gate)
+python scripts/paper_soak.py --i-mean-it --token-id <GREEN_TOKEN> --hours 72
+```
+
+Dashboard on `http://127.0.0.1:5055/api/state`. Final verdict in `soak_output/final_report.json`.
 
 ## Staging
 
 | Stage | Scope | Gate |
 |---|---|---|
-| 0 | Scaffold + Track A calibration | Paper §6 replication test passes |
+| 0 | Scaffold + Track A calibration | ✅ Paper §6 replication (multi-seed median MSE in ±10%) |
 | 1 | Tracks A+B+C on paper engine, single market | 72h paper run, positive edge, stable inventory |
 | 2 | Live CLOB orders, small size | 1-week live run, PnL attribution reconciles |
 | 3 | Cross-event β-hedges | Net cross-event vega within limit |
@@ -45,4 +60,4 @@ python -m blksch.app --mode=paper  # (not wired yet at Day-0)
 
 ## Status
 
-**Stage 0, Day 0 (scaffold).** See [`CATALOG.md`](./CATALOG.md) for current inventory.
+**Stage 0 CLEARED; Stage 1 ready for paper-soak launch.** Fast suite 1086/15/0. See [`CATALOG.md`](./CATALOG.md) for current inventory and [`SESSION_RESUME.md`](./SESSION_RESUME.md) for recent history.

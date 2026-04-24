@@ -8,11 +8,11 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 
 | Stage | Scope | Status |
 |---|---|---|
-| 0 | Scaffold + Track A calibration | 🛠 scaffold complete; Track A ingest underway; Tracks B + C Stage-1 done |
-| 1 | Tracks A+B+C on paper engine | 🛠 Tracks B + C Stage-1 shipped; awaiting Track A calibration to wire live surface |
-| 2 | Live CLOB orders | ⬜ |
-| 3 | Cross-event β-hedges | ⬜ |
-| 4 | Synthetic variance/corridor strips | ⬜ |
+| 0 | Scaffold + Track A calibration | ✅ CLEARED — multi-seed §6 replication gate passes (fac7d13) |
+| 1 | Tracks A+B+C on paper engine | 🛠 ready to launch — `python -m blksch.app --mode=paper` wired; `scripts/paper_soak.py` 72h harness ready |
+| 2 | Live CLOB orders | ⬜ gated on Stage-1 72h acceptance |
+| 3 | Cross-event β-hedges | ⬜ code built, `hedge_enabled=False` |
+| 4 | Synthetic variance/corridor strips | ⬜ code built, `calendar_hedge_enabled=False`, `synth_strip_enabled=False` |
 
 ## Root
 
@@ -38,7 +38,7 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 | File | Status | Notes |
 |---|---|---|
 | `schemas.py` | ✅ | Pydantic models for all inter-track messages |
-| `app.py` | ✅ | Stub entrypoint; prints "not wired yet" |
+| `app.py` | ✅ | Full asyncio orchestration: screener → polyclient WS → canonical_mid → Kalman → background em_calibrate → RefreshLoop → paper_engine/clob_client. `--mode=live` gated on `--live-ack`. |
 | `README.md` | ✅ | Package overview |
 
 ## Track A — Data & Calibration (`src/blksch/core/`)
@@ -50,13 +50,14 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 | `ingest/screener.py` | ✅ | — | Top-N volume+depth screener; TTL cache; correlation-pair resolution |
 | `filter/canonical_mid.py` | ✅ | §5.1 | Trade-weighted mid + clipping + K·IQR outlier reject + grid LOCF |
 | `filter/microstruct.py` | ✅ | §5.1 eq 10 | Heteroskedastic σ_η²(t); OLS fit; forward-fill widening; floor |
-| `filter/kalman.py` | ✅ | §5.1 | Heteroskedastic scalar KF on y=logit(p̃); UKF blend near boundary; gain-clip divergence safeguards |
+| `filter/kalman.py` | ✅ | §5.1 | Heteroskedastic scalar KF on y=logit(p̃); UKF blend near boundary; gain-clip divergence safeguards. **Known pathology:** \|x\|>4.5 inflates σ̂_b² 30–70% (see memory/project_boundary_regime_em_inflation.md) |
+| `filter/ewma_var.py` | ✅ | — | Streaming jump-aware EWMA σ̂_b²(u) forecast component (H=90s default); production σ̂_b² for the §6 gate forecast |
 | `em/increments.py` | ✅ | §5.2 | Mixture E-step: `γ_t` posteriors via log-sum-exp; frozen `MixtureParams` |
 | `em/jumps.py` | ✅ | §5.2 eq 11–12 | M-step λ̂ / ŝ²_J; jump-timestamp extraction; bi-power variation cross-check |
-| `em/rn_drift.py` | ✅ | §3.2 eq 3 | μ(t,x) via MC grid compile; `em_calibrate` outer loop |
-| `surface/smooth.py` | ⬜ | §5.3 | Tensor B-spline surface |
-| `surface/corr.py` | ⬜ | §5.4 | De-jumped ρ̂ + co-jumps |
-| `diagnostics.py` | ⬜ | §5.1 | Ljung–Box, Q–Q, variance checks |
+| `em/rn_drift.py` | ✅ | §3.2 eq 3 | μ(t,x) via MC grid compile; `em_calibrate` outer loop; BV warm-start |
+| `surface/smooth.py` | ✅ | §5.3 | Tensor B-spline surface; shape-constrained (nonneg, edge-stable) |
+| `surface/corr.py` | ✅ | §5.4 | De-jumped ρ̂ + co-jump moments; jump-window masking |
+| `diagnostics.py` | ✅ | §5.1 / §6.1 | Ljung–Box, Q–Q, realized-vs-implied variance consistency |
 
 ## Track B — Quoting Engine (`src/blksch/mm/`)
 
@@ -87,11 +88,11 @@ Status legend: ✅ built & tested · 🟡 built, needs tests · 🛠 in progress
 
 | Path | Status | Notes |
 |---|---|---|
-| `tests/unit/` | 🟡 | Tracks B + C complete (greeks/quote/guards/pnl/limits + ledger/signer/paper_engine/order_router); Track A polyclient ✅; remaining A modules pending |
-| `tests/integration/test_track_b_quote.py` | ✅ | Fixed-input Quote + toxicity widen + feed-gap pull + news widen + inventory cap |
-| `tests/integration/test_track_c_paper_engine.py` | ✅ | Scripted book/trade sequence → fills, ledger hand-calc reconciliation, feed-gap halt |
-| `tests/pipeline/` | ⬜ | End-to-end including Sec 6 replication |
-| `tests/fixtures/` | ⬜ | Recorded book snapshots, synthetic paths |
+| `tests/unit/` | ✅ | All modules covered; property-fuzz suite at `tests/unit/property/` (35 Hypothesis tests); snapshot regressions at `tests/unit/snapshot/` (25 golden fixtures, 1e-10 tolerance); fast suite total: 1086 passed / 15 skipped / 0 failed |
+| `tests/integration/` | ✅ | Track A calibration, Track B quote/hedge/ablation/calendar/synth_strip, Track C paper_engine, PnL reconciliation, adversarial kill-switches, app.py wiring (7 scenarios), calibration_dryrun offline |
+| `tests/contract/` | ✅ | polyclient + clob_client + testnet contract tests; fixtures recorded from live Polymarket (3b8371d) |
+| `tests/pipeline/` | ✅ | `test_paper_sec6_replication.py`: multi-seed median + robustness + causality (3 passing); kill_switch + live_paper_trade still stubs |
+| `tests/fixtures/` | ✅ | Synthetic RN-consistent path generator; contract fixtures recorded; snapshot fixtures pinned |
 
 ## Change log
 

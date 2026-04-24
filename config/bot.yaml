@@ -54,8 +54,10 @@ guards:
   queue_discipline_replace_ms: 150  # cancel+replace on adverse microstructure
 
 # --- Kill-switches (paper §4.6) ---
+# feed_gap_sec is set for residential/hotspot tolerance (was 3). Restore to 3
+# for cloud-hosted Stage-2 live-tiny where WS jitter is minimal.
 limits:
-  feed_gap_sec: 3                   # auto-pause if no tick for N seconds
+  feed_gap_sec: 10                  # auto-pause if no tick for N seconds (residential tolerance)
   volatility_spike_z: 5.0           # auto-pause if sigma_b jumps > Z stddevs
   repeated_pickoff_window_sec: 60   # lookback
   repeated_pickoff_count: 3         # N adverse fills in window -> pause
