@@ -557,3 +557,207 @@ async def test_missing_config_key_reports_dotted_path(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeError, match=r"bot\.quoting\.gamma"):
         await run(args, client=MockPolyClient([]), ledger=Ledger.in_memory())
+
+
+# ---------------------------------------------------------------------------
+# (8) Live-mode CLOB client setup — ownership-aware cleanup on failure
+# ---------------------------------------------------------------------------
+
+
+def _live_args() -> RunArgs:
+    """RunArgs for --mode=live --live-ack with an explicit token list (skips
+    the screener). Shared by the live-mode tests below."""
+    return RunArgs(
+        mode="live",
+        live_ack=True,
+        config_path=BOT_YAML,
+        markets_path=MARKETS_YAML,
+        log_level="WARNING",
+        tokens=[TOKEN],
+        rich_dashboard="off",
+    )
+
+
+def _wrap_ledger_close_tracking(ledger: Ledger, counter: dict[str, int]) -> Ledger:
+    """Wrap ``ledger.close`` so every call increments ``counter['n']``.
+
+    Used by the live-mode cleanup tests to verify that a run()-owned
+    Ledger (constructed inside run() because the caller passed
+    ``ledger=None``) is closed on the exception path.
+    """
+    original_close = ledger.close
+
+    def _tracked_close() -> None:
+        counter["n"] += 1
+        original_close()
+
+    ledger.close = _tracked_close  # type: ignore[method-assign]
+    return ledger
+
+
+@pytest.mark.asyncio
+async def test_live_mode_clob_config_failure_cleans_owned_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-soak audit regression: live-mode CLOB setup at app.py's
+    ``else:  # live`` branch used to lack the try/except-route-through-
+    _cleanup that the screener path got at 3ab856b. If
+    ``CLOBConfig.from_env`` raised (missing env var, malformed key),
+    ``owned_client`` and ``owned_ledger`` leaked. Not Stage-1 critical
+    because paper-mode never enters the branch, but required before any
+    ``--mode=live`` invocation.
+
+    We inject the client (``owned_client=False``) and leave ``ledger=None``
+    (``owned_ledger=True``) so a single run() exercises both halves of
+    the ownership contract.
+    """
+    from blksch.exec.clob_client import CLOBConfig as _CLOBConfig  # noqa: F401 (patch target)
+
+    close_counter = {"n": 0}
+    real_in_memory = Ledger.in_memory
+
+    def _tracking_in_memory(*args: Any, **kwargs: Any) -> Ledger:
+        return _wrap_ledger_close_tracking(real_in_memory(*args, **kwargs), close_counter)
+
+    monkeypatch.setattr(Ledger, "in_memory", _tracking_in_memory)
+    monkeypatch.setattr(
+        "blksch.app.CLOBConfig.from_env",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated: POLY_PRIVATE_KEY missing")),
+    )
+
+    mock_client = MockPolyClient([])
+    with pytest.raises(RuntimeError, match="POLY_PRIVATE_KEY missing"):
+        await run(_live_args(), client=mock_client, ledger=None, stop_event=asyncio.Event())
+
+    # Owned resource (the Ledger run() constructed) must be closed.
+    assert close_counter["n"] == 1, (
+        f"expected run()-owned ledger to be closed exactly once on the "
+        f"CLOBConfig.from_env failure path; got {close_counter['n']}"
+    )
+    # Non-owned resource (the injected client) must NOT be closed.
+    assert mock_client.closed is False, (
+        "injected (non-owned) client must not be closed by run() on failure"
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_mode_clob_client_factory_failure_cleans_owned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the CLOBConfig-failure test: same ownership contract,
+    different raise site. ``make_clob_client`` can fail on CLOB REST auth,
+    bad signer address, network flake — any of which previously leaked
+    owned resources.
+    """
+    close_counter = {"n": 0}
+    real_in_memory = Ledger.in_memory
+
+    def _tracking_in_memory(*args: Any, **kwargs: Any) -> Ledger:
+        return _wrap_ledger_close_tracking(real_in_memory(*args, **kwargs), close_counter)
+
+    monkeypatch.setattr(Ledger, "in_memory", _tracking_in_memory)
+
+    # Let CLOBConfig.from_env succeed (return a real CLOBConfig with a dummy
+    # address so construction doesn't trip the zero-address fail-closed
+    # check); the raise happens inside make_clob_client.
+    from blksch.exec.clob_client import CLOBConfig
+
+    def _dummy_cfg(*a: Any, **kw: Any) -> CLOBConfig:
+        return CLOBConfig(
+            base_url="https://clob-example.test",
+            chain_id=80002,
+            private_key="0x" + "11" * 32,
+            funder="0x" + "aa" * 20,
+            verifying_contract="0x" + "bb" * 20,
+        )
+
+    monkeypatch.setattr("blksch.app.CLOBConfig.from_env", _dummy_cfg)
+    monkeypatch.setattr(
+        "blksch.app.make_clob_client",
+        lambda cfg: (_ for _ in ()).throw(RuntimeError("simulated: CLOB REST auth failure")),
+    )
+
+    mock_client = MockPolyClient([])
+    with pytest.raises(RuntimeError, match="CLOB REST auth failure"):
+        await run(_live_args(), client=mock_client, ledger=None, stop_event=asyncio.Event())
+
+    assert close_counter["n"] == 1, (
+        "owned ledger must be closed when make_clob_client raises"
+    )
+    assert mock_client.closed is False, (
+        "injected client must not be closed on make_clob_client failure"
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_mode_success_path_still_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanity: the added try/except must not break the happy path. Patch
+    CLOBConfig.from_env + make_clob_client to return sane mocks, inject a
+    mock PolyClient that emits no events, drive run() with a short
+    max_runtime_sec watchdog, and assert clean termination."""
+
+    from blksch.exec.clob_client import CLOBConfig
+
+    def _dummy_cfg(*a: Any, **kw: Any) -> CLOBConfig:
+        return CLOBConfig(
+            base_url="https://clob-example.test",
+            chain_id=80002,
+            private_key="0x" + "22" * 32,
+            funder="0x" + "cc" * 20,
+            verifying_contract="0x" + "dd" * 20,
+        )
+
+    # Mock live CLOB backend — supports the calls app.py's shutdown path
+    # makes through router.cancel_all → live_backend.cancel_orders.
+    class _MockCLOBBackend:
+        def __init__(self) -> None:
+            self.closed = False
+            self.cancel_calls: list[str | None] = []
+
+        async def place_order(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
+            raise AssertionError("no order should be placed in this test")
+
+        async def cancel_order(self, *a: Any, **kw: Any) -> Any:  # pragma: no cover
+            return None
+
+        async def cancel_all(self, token_id: str | None = None) -> None:
+            self.cancel_calls.append(token_id)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    backend = _MockCLOBBackend()
+    monkeypatch.setattr("blksch.app.CLOBConfig.from_env", _dummy_cfg)
+    monkeypatch.setattr("blksch.app.make_clob_client", lambda cfg: backend)
+
+    args = RunArgs(
+        mode="live",
+        live_ack=True,
+        config_path=BOT_YAML,
+        markets_path=MARKETS_YAML,
+        log_level="WARNING",
+        tokens=[TOKEN],
+        rich_dashboard="off",
+        max_runtime_sec=0.5,
+    )
+    mock_client = MockPolyClient([])
+    ledger = Ledger.in_memory()
+
+    # Should complete within the watchdog window (0.5 s) without raising.
+    await asyncio.wait_for(
+        run(args, client=mock_client, ledger=ledger, stop_event=asyncio.Event()),
+        timeout=5.0,
+    )
+
+    # Injected resources survive (ownership contract).
+    _ = ledger.pnl()
+    assert mock_client.closed is False
+
+    # Shutdown exercised router.cancel_all → backend.cancel_all at least once.
+    # (exact count depends on refresh cadence; we just need evidence of the
+    # success-path cleanup running.)
+    assert backend.cancel_calls, (
+        "expected cancel_all to fire at least once during graceful shutdown"
+    )

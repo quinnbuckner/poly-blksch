@@ -684,8 +684,24 @@ async def run(
         router = OrderRouter(paper_backend=paper_engine,
                              config=RouterConfig(mode="paper"))
     else:  # live
-        clob_cfg = CLOBConfig.from_env(testnet=(cfg.network != "mainnet"))
-        live_backend = make_clob_client(clob_cfg)
+        # Live-mode CLOB setup touches the environment (API keys, funder
+        # address, verifying contract) and the network; both CLOBConfig
+        # .from_env and make_clob_client can raise — missing/invalid env
+        # var, bad signer address, CLOB REST auth failure. Route any
+        # failure through the same ownership-aware _cleanup path the
+        # screener-failure branch uses (3ab856b) so owned resources are
+        # released and externally-injected ones stay live for the
+        # caller's inspection of the raised exception.
+        try:
+            clob_cfg = CLOBConfig.from_env(testnet=(cfg.network != "mainnet"))
+            live_backend = make_clob_client(clob_cfg)
+        except Exception:
+            logger.exception("CLOB client setup failed — aborting startup")
+            await _cleanup(
+                client if owned_client else None,
+                ledger if owned_ledger else None,
+            )
+            raise
         router = OrderRouter(
             live_backend=live_backend,
             config=RouterConfig(mode="live", live_ack=True),
