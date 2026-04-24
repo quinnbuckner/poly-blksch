@@ -61,6 +61,10 @@ DEFAULT_INNOVATION_FLOOR = 1.0e-8
 DEFAULT_INITIAL_VARIANCE = 1.0
 DEFAULT_SIGMA_B = 0.3
 DEFAULT_MAX_DT_SEC = 60.0  # cap dt so a long gap doesn't blow up Q
+# Boundary UKF augmentation — floor on S'(x) used in the p→x back-
+# projection, and cap on the ratio r_ukf / R_raw. See ``_effective_R``.
+DEFAULT_MIN_JACOBIAN = 1.0e-3
+DEFAULT_MAX_UKF_R_MULTIPLIER = 50.0
 
 
 class VarianceOracle(Protocol):
@@ -105,6 +109,8 @@ class KalmanFilter:
     boundary_p_high: float = DEFAULT_BOUNDARY_P_HIGH
     innovation_variance_floor: float = DEFAULT_INNOVATION_FLOOR
     max_dt_sec: float = DEFAULT_MAX_DT_SEC
+    min_jacobian: float = DEFAULT_MIN_JACOBIAN
+    max_ukf_r_multiplier: float = DEFAULT_MAX_UKF_R_MULTIPLIER
 
     _x: float = field(init=False, default=0.0, repr=False)
     _P: float = field(init=False, default=1.0, repr=False)
@@ -128,6 +134,10 @@ class KalmanFilter:
             raise ValueError("boundary_p_high must be in (0.5, 1)")
         if self.max_dt_sec <= 0:
             raise ValueError("max_dt_sec must be positive")
+        if self.min_jacobian <= 0:
+            raise ValueError("min_jacobian must be positive")
+        if self.max_ukf_r_multiplier < 1.0:
+            raise ValueError("max_ukf_r_multiplier must be ≥ 1")
         self._P = self.initial_variance
         if self.initial_x is not None:
             self._x = self.initial_x
@@ -254,6 +264,23 @@ class KalmanFilter:
         ``alpha → 1`` at p ∈ {0, 1} → returns max(R_raw, R_ukf).
         Blend weight is quadratic in the margin-to-edge so the posterior
         mean transitions continuously as p moves through p_low / p_high.
+
+        Boundary safeguards (track-a-boundary-regime-kalman):
+
+        * ``dpdx`` is floored at ``min_jacobian`` so the p→x back-
+          projection doesn't explode when S'(x) → 0 at deep boundary
+          (|x| > ~7). Below the floor the microstruct R is the right
+          answer — no amount of UKF augmentation can disambiguate x
+          from p̃ once the sigmoid is fully saturated.
+        * ``r_ukf`` is capped at ``max_ukf_r_multiplier · R_raw``. The
+          uncapped formula produces r_ukf that grows quadratically in
+          1/S'(x) because p_var shrinks more slowly than S'(x) as x
+          drifts into the boundary. Unbounded r_ukf drives the Kalman
+          gain to ~0, the filter lags the observation, and re-entries
+          to the interior produce catch-up bursts in Δx̂ that the
+          downstream EM reads as elevated σ_b² (see
+          ``project_boundary_regime_em_inflation.md`` for the gate-
+          level MSE blow-up this pathology caused).
         """
         margin = min(p, 1.0 - p)
         threshold = min(self.boundary_p_low, 1.0 - self.boundary_p_high)
@@ -285,14 +312,12 @@ class KalmanFilter:
             + w_side * (p_minus - p_mean) ** 2
         )
 
-        # Translate p-space variance back to x-space via the Jacobian at the
-        # predicted mean. Near total saturation S'(x) collapses; widen R a lot
-        # so the gain clip takes over.
+        # Translate p-space variance back to x-space via the Jacobian at
+        # the predicted mean, with the two safeguards described above.
         dpdx = p_chi0 * (1.0 - p_chi0)
-        if dpdx < 1e-8:
-            r_ukf = R_raw * 1.0e6
-        else:
-            r_ukf = p_var / (dpdx * dpdx)
+        dpdx_eff = max(dpdx, self.min_jacobian)
+        r_ukf = p_var / (dpdx_eff * dpdx_eff)
+        r_ukf = min(r_ukf, self.max_ukf_r_multiplier * R_raw)
 
         return (1.0 - alpha) * R_raw + alpha * max(R_raw, r_ukf)
 
@@ -303,6 +328,8 @@ __all__ = [
     "DEFAULT_INITIAL_VARIANCE",
     "DEFAULT_INNOVATION_FLOOR",
     "DEFAULT_MAX_DT_SEC",
+    "DEFAULT_MAX_UKF_R_MULTIPLIER",
+    "DEFAULT_MIN_JACOBIAN",
     "DEFAULT_SIGMA_B",
     "KalmanFilter",
     "VarianceOracle",

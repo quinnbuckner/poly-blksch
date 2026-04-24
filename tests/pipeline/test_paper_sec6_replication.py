@@ -582,3 +582,46 @@ def test_forward_sum_operator_is_causal() -> None:
     expected_0 = float(np.sum((np.diff(a, prepend=a[0])[1: 1 + h]) ** 2))
     assert out[0] == pytest.approx(expected_0)
     assert out[-h:].sum() == 0.0
+
+
+def test_filter_output_not_the_sigma_b_inflation_source() -> None:
+    """Diagnostic: on seed=100 (the canonical 12× MSE blowup case), the
+    FILTER's Δx̂ std is NOT meaningfully above the true σ_b. The EM's σ̂_b
+    estimate is inflated ~40%, but that comes from drift-mis-specification
+    downstream (em/rn_drift.py), not from the Kalman filter or its UKF
+    blend at boundary.
+
+    This test locks that diagnosis in — if it starts failing, the
+    assumption in ``project_boundary_regime_em_inflation.md`` about the
+    pathology being in kalman.py needs revisiting.
+    """
+    cfg = SyntheticConfig(n_steps=6000, dt_sec=1.0, rng_seed=100, sigma_b=0.026)
+    path = generate_rn_consistent_path(cfg)
+    y, sigma_eta2 = inject_microstructure_noise(path.x, rng_seed=43)
+
+    books = _build_book_stream(y, sigma_eta2, dt_sec=cfg.dt_sec)
+    microstruct = _fit_microstruct(books, sigma_eta2, fit_window=1200)
+    states, _innov = _run_filter_stream(
+        books, microstruct, sigma_b_seed=cfg.sigma_b,
+    )
+
+    x_hat = np.asarray([s.x_hat for s in states], dtype=float)
+    dx_hat = np.diff(x_hat)
+    n_boundary = int(np.sum(np.abs(x_hat[:-1]) >= 4.0))
+    # Some of seed=100's path drifts above |x|=4 late in the run; at
+    # least 50 boundary steps is enough to statistically exercise the
+    # UKF augmentation.
+    assert n_boundary >= 50, f"seed=100 path didn't reach |x|≥4 often: {n_boundary} steps"
+
+    # Empirical σ_b on the filter output (no EM, no rolling, no drift).
+    emp_sigma_b = float(np.std(dx_hat))
+    inflation = emp_sigma_b / cfg.sigma_b
+    # Filter-only inflation well inside 1.5× — the rolling-EM's 1.4×
+    # inflation is therefore not coming from the filter.
+    assert inflation < 1.5, (
+        f"filter-only inflation would be a new finding: "
+        f"emp σ̂_b={emp_sigma_b:.4f} is {inflation:.2f}× truth "
+        f"{cfg.sigma_b:.4f}. If this starts failing, the kalman.py "
+        "UKF blend is actually responsible for σ̂_b inflation and the "
+        "commit rationale in track-a-boundary-regime-kalman was wrong."
+    )

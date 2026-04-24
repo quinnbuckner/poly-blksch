@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -415,3 +416,82 @@ def test_long_gap_is_capped() -> None:
     kf.step(_cm(t0 + timedelta(hours=1), 0.0), _book(0.5))
     # Posterior variance stays comparable to capped predict + innovation.
     assert kf.posterior_variance < 30.0
+
+
+# ---------- Boundary-regime EM inflation regression (track-a-boundary-regime-kalman) ----------
+
+
+def test_kalman_no_sigma_b_inflation_at_boundary() -> None:
+    """Drive a synthetic path toward |x|=5 at constant true σ_b; the
+    filter's Δx̂ variance (which the EM reads as σ̂_b²) must stay within
+    2× of the truth in the boundary regime, not 30-70% inflated per the
+    pre-fix pathology (see ``project_boundary_regime_em_inflation.md``).
+
+    Pre-fix mechanism: inside p ∈ [p_low, p_high] the ``_effective_R``
+    blend computes ``r_ukf = p_var / S'(x)²``. At |x|>4.5 the Jacobian
+    S'(x) ≈ p(1-p) is O(1e-3) or smaller, so ``r_ukf`` explodes to
+    ~P_pred / ε range, K collapses to near zero, the filter lags the
+    observation, and each re-entry to the interior regime produces a
+    catch-up burst in Δx̂ that the downstream EM reads as elevated σ_b².
+    """
+    rng = np.random.default_rng(100)
+    n = 2000
+    sigma_b = 0.026  # matches the paper §6 gate regime
+    sigma_eta = 0.005
+
+    # Mean-reverting process that parks ~5 and oscillates with the
+    # diffusion. Under a pure RW the path rarely returns once past |x|=4;
+    # we want both entries AND exits from the boundary region because the
+    # pathology is specifically in the filter catch-up when p re-crosses
+    # back into the interior (KF gain recovers, Δx̂ burst — the EM reads
+    # the burst as elevated σ̂_b).
+    x_true = np.empty(n)
+    x_true[0] = 0.0
+    target = 4.8
+    half_life = 300.0  # steps; gentle pull so there's meaningful path variance
+    mean_rev = math.log(2.0) / half_life
+    for t in range(1, n):
+        pull = -mean_rev * (x_true[t - 1] - target)
+        x_true[t] = x_true[t - 1] + pull + rng.normal(0.0, sigma_b)
+    y_obs = x_true + rng.normal(0.0, sigma_eta, size=n)
+
+    # Sanity: path must enter the boundary regime and also leave it at
+    # least a few times; otherwise we're not testing the catch-up path.
+    in_boundary_true = np.abs(x_true) >= 4.0
+    crossings = int(np.sum(np.diff(in_boundary_true.astype(int)) != 0))
+    assert in_boundary_true.sum() >= 300 and crossings >= 4, (
+        f"test setup: path didn't oscillate enough across |x|=4 "
+        f"(in-boundary={in_boundary_true.sum()}, crossings={crossings})"
+    )
+
+    kf = KalmanFilter(
+        token_id="t",
+        microstruct=ConstantMicrostruct(sigma_eta * sigma_eta),
+        sigma_b=sigma_b,
+    )
+    t0 = datetime(2026, 4, 24, tzinfo=UTC)
+    x_hat = np.empty(n)
+    for t in range(n):
+        ts = t0 + timedelta(seconds=t)
+        p_obs = max(1e-5, min(1.0 - 1e-5, _sigmoid(float(y_obs[t]))))
+        state = kf.step(_cm(ts, float(y_obs[t])), _book(p_obs))
+        x_hat[t] = state.x_hat
+
+    dx = np.diff(x_hat)
+    # Measure empirical σ̂_b in the boundary regime (|x̂|≥4.0). The EM
+    # estimates σ_b from Δx̂; if the filter's steady-state Δx̂ std in the
+    # boundary is ≥2× truth, the gate gets the 10× MSE blowup.
+    in_boundary = np.abs(x_hat[:-1]) >= 4.0
+    n_boundary = int(in_boundary.sum())
+    assert n_boundary >= 150, (
+        f"test setup: only {n_boundary} steps with |x̂|≥4.0, need ≥150 "
+        "for a meaningful σ̂_b estimate"
+    )
+    emp_sigma_b = float(np.std(dx[in_boundary]))
+    inflation = emp_sigma_b / sigma_b
+    assert inflation < 2.0, (
+        f"σ̂_b inflation in boundary regime: empirical "
+        f"{emp_sigma_b:.4f} is {inflation:.2f}× truth {sigma_b:.4f}. "
+        "The _effective_R blend is amplifying filter noise via the "
+        "1/S'(x)² term — saturate or cap r_ukf (see commit message)."
+    )
