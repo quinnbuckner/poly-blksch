@@ -1032,3 +1032,134 @@ def test_child_rc_zero_logs_at_info_not_error(monkeypatch, tmp_path, caplog):
         f"BUG-5: rc=0 child exit must be announced at INFO as 'exited "
         f"cleanly'; got INFO messages: {info_msgs}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage-2 prep small additions (track-c-stage2-prep-small)
+# ---------------------------------------------------------------------------
+
+
+def test_paper_soak_min_hours_flag(monkeypatch, tmp_path):
+    """``--min-hours FLOAT`` decouples the acceptance gate's duration
+    floor from ``--hours``. A 36 h residential data-gather should
+    accept at 36 h instead of demanding 72 h via the prior coupling
+    (where ``criteria.min_hours = args.hours``).
+
+    Stub ``run_soak`` to capture the criteria handed to it, then
+    assert the threading is correct. This is a CLI-wiring regression,
+    not a behavioral change to evaluate() itself.
+    """
+    captured: dict = {}
+
+    async def _stub_run(cfg, *, criteria=None):
+        captured["criteria"] = criteria
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        result = soak.AcceptanceResult(passed=True, results=[])
+        soak._write_final(cfg.out_dir, [], result, elapsed_wall_time_sec=0.0)
+        return result
+
+    monkeypatch.setattr(soak, "run_soak", _stub_run)
+
+    # Default: --min-hours unspecified → 72.0
+    rc = soak.main([
+        "--i-mean-it", "--hours", "1",
+        "--out", str(tmp_path / "default"),
+    ])
+    assert rc == 0
+    assert captured["criteria"].min_hours == 72.0, (
+        f"default --min-hours must be 72.0; got {captured['criteria'].min_hours}"
+    )
+
+    # Explicit override decoupled from --hours.
+    rc = soak.main([
+        "--i-mean-it", "--hours", "36", "--min-hours", "36",
+        "--out", str(tmp_path / "thirty-six"),
+    ])
+    assert rc == 0
+    assert captured["criteria"].min_hours == 36.0, (
+        f"--min-hours 36 must thread; got {captured['criteria'].min_hours}"
+    )
+
+    # Sub-hour fractional (rehearsal use case).
+    rc = soak.main([
+        "--i-mean-it", "--hours", "0.05", "--min-hours", "0.02",
+        "--out", str(tmp_path / "rehearsal"),
+    ])
+    assert rc == 0
+    assert captured["criteria"].min_hours == 0.02
+
+    # And: --hours and --min-hours are independent — passing only --hours
+    # must NOT change the min_hours default away from 72.0.
+    rc = soak.main([
+        "--i-mean-it", "--hours", "12",
+        "--out", str(tmp_path / "hours-only"),
+    ])
+    assert captured["criteria"].min_hours == 72.0, (
+        "--hours must NOT silently retune --min-hours; the decoupling "
+        "is the whole point of the new flag"
+    )
+
+
+def test_paper_soak_soak_output_dir_flag(monkeypatch, tmp_path):
+    """``--soak-output-dir PATH`` (alias of ``--out``) routes every
+    artifact (final_report.json, soak_report_*.json, child.log, the
+    runtime-resolved cfg.out_dir) into the override directory so
+    parallel / sequential soaks don't clobber each other.
+
+    Pin both spellings — the user-facing rehearsal command uses the
+    long form; the short ``--out`` form must still work for callers
+    who already wrote scripts against it.
+    """
+    captured: dict = {}
+
+    async def _stub_run(cfg, *, criteria=None):
+        captured["out_dir"] = cfg.out_dir
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        # Drop a soak_report_000.json so the artifact-landing assertion
+        # matches the production layout.
+        result = soak.AcceptanceResult(passed=True, results=[])
+        report = soak.HourlyReport(
+            hour_index=0, started_at="t0", ended_at="t1", samples=1,
+            quote_uptime_pct=0.0, fills_in_hour=0,
+            realized_pnl_hour_usd=0.0, realized_pnl_cumulative_usd=0.0,
+            fees_cumulative_usd=0.0, inventory_peak_notional_usd=0.0,
+            inventory_peak_qty_by_token={}, kill_switch_events=0,
+            halt_events=0, pnl_attribution_residual_usd=0.0,
+        )
+        soak._write_hour(cfg.out_dir, report)
+        soak._write_final(cfg.out_dir, [report], result, elapsed_wall_time_sec=0.0)
+        return result
+
+    monkeypatch.setattr(soak, "run_soak", _stub_run)
+
+    # Long form (--soak-output-dir).
+    long_form_dir = tmp_path / "long-form"
+    rc = soak.main([
+        "--i-mean-it", "--hours", "1",
+        "--soak-output-dir", str(long_form_dir),
+    ])
+    assert rc == 0
+    assert captured["out_dir"] == long_form_dir, (
+        f"--soak-output-dir must thread to cfg.out_dir; "
+        f"got {captured['out_dir']} expected {long_form_dir}"
+    )
+    assert (long_form_dir / "final_report.json").exists()
+    assert (long_form_dir / "soak_report_000.json").exists()
+
+    # Short form (--out) still works — backward compat for any operator
+    # script written before the rename.
+    short_form_dir = tmp_path / "short-form"
+    rc = soak.main([
+        "--i-mean-it", "--hours", "1",
+        "--out", str(short_form_dir),
+    ])
+    assert rc == 0
+    assert captured["out_dir"] == short_form_dir
+    assert (short_form_dir / "final_report.json").exists()
+
+    # Default still ./soak_output (unchanged).
+    monkeypatch.chdir(tmp_path)
+    rc = soak.main([
+        "--i-mean-it", "--hours", "1",
+    ])
+    assert captured["out_dir"] == Path("./soak_output")

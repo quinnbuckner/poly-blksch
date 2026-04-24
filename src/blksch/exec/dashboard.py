@@ -17,6 +17,7 @@ mutates bot state — the dashboard is purely an observer.
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -323,9 +324,35 @@ class FlaskDashboard:
             return jsonify({"status": "ok", "ts": datetime.now(UTC).isoformat(),
                             "mode": self.ctx.mode})
 
-    def run(self, host: str = "127.0.0.1", port: int = 5055) -> None:  # pragma: no cover
-        log.info("FlaskDashboard listening on %s:%d", host, port)
-        self.app.run(host=host, port=port, debug=False, use_reloader=False)
+    def run(self, host: str = "127.0.0.1", port: int | None = None) -> None:  # pragma: no cover
+        resolved_port = resolve_dashboard_port(port)
+        log.info("FlaskDashboard listening on %s:%d", host, resolved_port)
+        self.app.run(host=host, port=resolved_port, debug=False, use_reloader=False)
+
+
+def resolve_dashboard_port(explicit_port: int | None = None) -> int:
+    """Return the port the Flask dashboard should bind to.
+
+    Precedence, highest first:
+      1. ``explicit_port`` arg (the caller passed an int).
+      2. ``BLKSCH_DASHBOARD_PORT`` env var.
+      3. Default 5055.
+
+    Exposed as a module-level helper so ``scripts/paper_soak.py`` can
+    compute the expected ``/api/state`` URL without duplicating the
+    env-var logic. Unit-tested in ``tests/unit/test_exec_dashboard.py``.
+    """
+    if explicit_port is not None:
+        return int(explicit_port)
+    raw = os.environ.get("BLKSCH_DASHBOARD_PORT")
+    if raw is None or raw == "":
+        return 5055
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"BLKSCH_DASHBOARD_PORT must be an integer; got {raw!r}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

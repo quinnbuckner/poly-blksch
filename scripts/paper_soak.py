@@ -650,15 +650,39 @@ def main(argv: list[str] | None = None) -> int:
             "rehearsals (e.g. --hours 0.05 ≈ 3 minutes)."
         ),
     )
-    parser.add_argument("--dashboard-url", default="http://127.0.0.1:5055/api/state")
+    parser.add_argument("--dashboard-url", default=None,
+                        help=(
+                            "Override the dashboard JSON URL. Default is "
+                            "derived from BLKSCH_DASHBOARD_PORT env var (or "
+                            "5055 if unset): http://127.0.0.1:<port>/api/state."
+                        ))
     parser.add_argument("--sample-interval-sec", type=float, default=5.0)
-    parser.add_argument("--out", type=Path, default=Path("./soak_output"))
+    parser.add_argument(
+        "--out", "--soak-output-dir", dest="out", type=Path,
+        default=Path("./soak_output"),
+        help=(
+            "Directory for soak artifacts (final_report.json, "
+            "soak_report_*.json, child.log). Default ./soak_output. "
+            "Override so parallel / sequential soaks don't overwrite "
+            "each other. ``--soak-output-dir`` is the preferred spelling; "
+            "``--out`` is retained as an alias for brevity."
+        ),
+    )
     parser.add_argument("--token-id", default=None)
     parser.add_argument("--app-cmd", default=None,
                         help="Override child command (space-separated). Must include --mode=paper.")
     parser.add_argument("--i-mean-it", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     # Criteria overrides (rare; defaults match bot.yaml / plan).
+    parser.add_argument(
+        "--min-hours", type=float, default=72.0,
+        help=(
+            "Minimum hourly-reports count the acceptance gate requires. "
+            "Decoupled from --hours so a sub-72h rehearsal can tighten "
+            "its acceptance semantics (e.g. --hours 36 --min-hours 36 for "
+            "a 36h data-gather run). Default 72.0."
+        ),
+    )
     parser.add_argument("--min-quote-uptime-pct", type=float, default=95.0)
     parser.add_argument("--max-inventory-notional-usd", type=float, default=50.0)
     parser.add_argument("--max-pnl-attribution-residual-usd", type=float, default=0.5)
@@ -680,9 +704,23 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # Dashboard URL resolution: explicit --dashboard-url wins, otherwise
+    # derive from BLKSCH_DASHBOARD_PORT (env var or 5055 default). Importing
+    # the exec module keeps the env-var precedence in a single source of truth
+    # — dashboard.py owns ``BLKSCH_DASHBOARD_PORT``; paper_soak reuses it.
+    if args.dashboard_url is not None:
+        resolved_dashboard_url = args.dashboard_url
+    else:
+        # Local import so Track C script help works without the app installed
+        # (the script is operator tooling; lazy dep keeps ``--help`` snappy).
+        from blksch.exec.dashboard import resolve_dashboard_port
+        resolved_dashboard_url = (
+            f"http://127.0.0.1:{resolve_dashboard_port()}/api/state"
+        )
+
     cfg = SoakConfig(
         hours=args.hours,
-        dashboard_url=args.dashboard_url,
+        dashboard_url=resolved_dashboard_url,
         sample_interval_sec=args.sample_interval_sec,
         out_dir=args.out,
         token_id=args.token_id,
@@ -694,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg.app_cmd = args.app_cmd.split()
 
     criteria = AcceptanceCriteria(
-        min_hours=args.hours,
+        min_hours=args.min_hours,
         min_quote_uptime_pct=args.min_quote_uptime_pct,
         max_inventory_notional_usd=args.max_inventory_notional_usd,
         max_pnl_attribution_residual_usd=args.max_pnl_attribution_residual_usd,

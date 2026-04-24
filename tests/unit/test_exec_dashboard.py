@@ -16,6 +16,7 @@ from blksch.exec.dashboard import (
     RichDashboard,
     StalenessThresholds,
     _fmt_age,
+    resolve_dashboard_port,
 )
 from blksch.exec.ledger import Ledger
 from blksch.schemas import (
@@ -204,3 +205,41 @@ def test_rich_layout_builds_with_full_data(ctx: DashboardContext):
     assert "σ̂_b" in text or "sigma" in text.lower() or "0.3500" in text
     # Staleness pane populated with finite ages (not "never")
     assert "never" not in text.split("Data staleness")[-1].split("Recent fills")[0]
+
+
+# ---------------------------------------------------------------------------
+# BLKSCH_DASHBOARD_PORT env override (track-c-stage2-prep-small)
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_port_env_override(monkeypatch):
+    """``resolve_dashboard_port()`` precedence: explicit > env var > 5055.
+
+    Dashboard port used to be hardcoded to 5055 in ``FlaskDashboard.run``.
+    Parallel soaks / port-conflict diagnostics need a per-invocation
+    override without editing code — the env var is the idiomatic hook.
+    Explicit argument still wins for call sites that compute a port some
+    other way (e.g. app.py pulling ``args.dashboard_port``).
+    """
+    # Unset → 5055 default.
+    monkeypatch.delenv("BLKSCH_DASHBOARD_PORT", raising=False)
+    assert resolve_dashboard_port() == 5055
+
+    # Empty string also treated as unset (subprocess.Popen passes "" for
+    # an unset-yet-declared env var in some shells; don't crash on that).
+    monkeypatch.setenv("BLKSCH_DASHBOARD_PORT", "")
+    assert resolve_dashboard_port() == 5055
+
+    # Env override.
+    monkeypatch.setenv("BLKSCH_DASHBOARD_PORT", "8080")
+    assert resolve_dashboard_port() == 8080
+
+    # Explicit arg wins over env var.
+    monkeypatch.setenv("BLKSCH_DASHBOARD_PORT", "8080")
+    assert resolve_dashboard_port(9191) == 9191
+
+    # Non-integer env value must fail loudly — silent fallback to 5055
+    # would mask a typo in ``BLKSCH_DASHBOARD_PORT=eigthy-eighty``.
+    monkeypatch.setenv("BLKSCH_DASHBOARD_PORT", "not-a-number")
+    with pytest.raises(RuntimeError, match="BLKSCH_DASHBOARD_PORT"):
+        resolve_dashboard_port()
